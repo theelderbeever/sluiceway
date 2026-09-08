@@ -1,0 +1,28 @@
+[package]
+name = "penstock"
+description = "Facade for the Penstock typed branching pipeline framework"
+edition.workspace = true
+version.workspace = true
+
+[features]
+default = []
+io = ["dep:penstock-io", "penstock-io/filesystem"]
+object-store = ["io", "penstock-io/object-store"]
+sql-postgres = ["io", "penstock-io/sql-postgres"]
+sql-mysql = ["io", "penstock-io/sql-mysql"]
+sql-sqlite = ["io", "penstock-io/sql-sqlite"]
+sql = ["sql-postgres", "sql-mysql", "sql-sqlite"]
+full = ["object-store", "sql"]
+
+[dependencies]
+penstock-core.workspace = true
+penstock-io = { workspace = true, optional = true }
+
+[dev-dependencies]
+futures-core.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[lints]
+workspace = true

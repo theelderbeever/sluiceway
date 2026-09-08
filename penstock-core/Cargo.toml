@@ -1,0 +1,18 @@
+[package]
+name = "penstock-core"
+description = "Core traits and runner for the Penstock branching pipeline framework"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+futures-core.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio-stream.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync"] }
+
+[lints]
+workspace = true

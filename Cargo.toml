@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = [
+    "penstock",
+    "penstock-core",
+    "penstock-io",
+]
+default-members = ["penstock"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+futures-core = "0.3.33"
+futures-util = { version = "0.3.33", default-features = false, features = ["async-await", "std"] }
+object_store = "0.14.1"
+penstock-core = { version = "0.1.0", path = "penstock-core" }
+penstock-io = { version = "0.1.0", path = "penstock-io", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sqlx-core = { version = "=0.8.6", default-features = false }
+sqlx-mysql = { version = "=0.8.6", default-features = false }
+sqlx-postgres = { version = "=0.8.6", default-features = false }
+sqlx-sqlite = { version = "=0.8.6", default-features = false }
+tempfile = "3.27.0"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", default-features = false }
+tokio-stream = { version = "0.1.19", features = ["time"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+complexity = { level = "warn", priority = -1 }
