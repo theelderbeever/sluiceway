@@ -30,7 +30,7 @@ use penstock::{Batch, BatchPolicy, Pipeline, Sink};
 # async fn run<S, K>(source: S, sink: K) -> Result<(), Box<dyn std::error::Error>>
 # where
 #     S: penstock::Source<Payload = Vec<u8>>,
-#     K: Sink<Batch<usize, S::Cursor>, Cursor = S::Cursor>,
+#     K: Sink<Batch<usize, S::Cursor>>,
 #     S::Error: 'static,
 # {
 Pipeline::source(source)
@@ -55,8 +55,8 @@ fanout boundary, allowing heterogeneous sinks in one array:
 # where
 #     S: penstock::Source<Payload = Vec<u8>>,
 #     S::Error: 'static,
-#     A: Sink<SharedBatch<Vec<u8>, S::Cursor>, Cursor = S::Cursor> + 'static,
-#     B: Sink<SharedBatch<Vec<u8>, S::Cursor>, Cursor = S::Cursor> + 'static,
+#     A: Sink<SharedBatch<Vec<u8>, S::Cursor>> + 'static,
+#     B: Sink<SharedBatch<Vec<u8>, S::Cursor>> + 'static,
 # {
 Pipeline::source(source)
     .transform(|payload: Vec<u8>| async move { Ok::<_, Infallible>(payload) })
@@ -70,16 +70,17 @@ Pipeline::source(source)
 # }
 ```
 
-Fanout requires an explicit ownership mode. `.cloned()` gives each sink an owned `Batch<T, C>` and
-can reuse linear sinks; `.shared()` gives every sink the same `SharedBatch<T, C>`, an alias for
-`Arc<[Record<T, C>]>`. `.sinks(...)` accepts arrays or dynamically assembled vectors of the
-corresponding `BoxSink`. An empty fanout returns `PipelineError::NoSinks` before the source starts.
-Every fanout task is drained, and the source cursor is committed only when every sink acknowledges
-the final cursor.
+`Batch<T, C>` contains transformed `items` and one source-selected `cursor`. Fanout requires an
+explicit ownership mode. `.cloned()` gives each sink an owned batch and can reuse linear sinks;
+`.shared()` gives every sink the same `Arc<Batch<T, C>>`. `.sinks(...)` accepts arrays or dynamically
+assembled vectors of the corresponding `BoxSink`. An empty fanout returns `PipelineError::NoSinks`
+before the source starts. Every fanout task is drained, and the source cursor is committed only when
+every sink succeeds.
 
-The cursor is opaque to the runner: it needs equality for acknowledgment validation but does not
-need to be numeric or ordered. Checkpoint persistence remains source-owned through
-`CheckpointStore<C>`.
+Individual source records carry message-local positions. When a batch closes, the source folds
+those positions into its batch cursor while the runner moves the transformed payloads into the
+batch. The cursor remains opaque to the runner, and checkpoint persistence remains source-owned
+through `CheckpointStore<C>`.
 
 Checkpoint adapters are available through facade features. `io` enables local files,
 `object-store` adds caller-configured object stores, and `sql-postgres`, `sql-mysql`, and

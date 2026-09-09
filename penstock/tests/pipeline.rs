@@ -37,12 +37,13 @@ struct Numbers {
 
 impl Source for Numbers {
     type Payload = u64;
+    type Position = Cursor;
     type Cursor = Cursor;
     type Error = Infallible;
 
     fn stream(
         &self,
-    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Cursor>, Self::Error>> + Send + '_
+    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_
     {
         stream::iter(
             self.values
@@ -51,6 +52,10 @@ impl Source for Numbers {
                 .enumerate()
                 .map(|(offset, payload)| Ok(Record::new(Cursor::at(offset as u64), payload))),
         )
+    }
+
+    fn track(_cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
+        position
     }
 
     async fn commit(&self, cursor: Self::Cursor) -> Result<(), Self::Error> {
@@ -77,7 +82,6 @@ struct TestSinkError;
 #[derive(Clone, Copy)]
 enum Ack {
     Exact,
-    Next,
     Fail,
 }
 
@@ -86,16 +90,14 @@ struct LinearCollector<T> {
     ack: Ack,
 }
 
-type LinearRecords<T> = Arc<Mutex<Vec<Record<T, Cursor>>>>;
+type LinearRecords<T> = Arc<Mutex<Vec<T>>>;
 
 impl<T: Send> Sink<Batch<T, Cursor>> for LinearCollector<T> {
-    type Cursor = Cursor;
     type Error = TestSinkError;
 
-    async fn deliver(&self, batch: Batch<T, Self::Cursor>) -> Result<Self::Cursor, Self::Error> {
-        let cursor = batch.last().expect("batches are non-empty").cursor.clone();
+    async fn deliver(&self, batch: Batch<T, Cursor>) -> Result<(), Self::Error> {
         self.records.lock().unwrap().extend(batch);
-        acknowledge(self.ack, cursor)
+        acknowledge(self.ack)
     }
 }
 
@@ -118,16 +120,11 @@ struct SharedCollector<T> {
 }
 
 impl<T: Send + Sync + 'static> Sink<SharedBatch<T, Cursor>> for SharedCollector<T> {
-    type Cursor = Cursor;
     type Error = TestSinkError;
 
-    async fn deliver(
-        &self,
-        batch: SharedBatch<T, Self::Cursor>,
-    ) -> Result<Self::Cursor, Self::Error> {
-        let cursor = batch.last().expect("batches are non-empty").cursor.clone();
+    async fn deliver(&self, batch: SharedBatch<T, Cursor>) -> Result<(), Self::Error> {
         self.batches.lock().unwrap().push(batch);
-        acknowledge(self.ack, cursor)
+        acknowledge(self.ack)
     }
 }
 
@@ -142,10 +139,9 @@ fn shared_collector<T>(ack: Ack) -> (SharedCollector<T>, SharedBatches<T>) {
     )
 }
 
-fn acknowledge(ack: Ack, cursor: Cursor) -> Result<Cursor, TestSinkError> {
+fn acknowledge(ack: Ack) -> Result<(), TestSinkError> {
     match ack {
-        Ack::Exact => Ok(cursor),
-        Ack::Next => Ok(Cursor::at(cursor.offset + 1)),
+        Ack::Exact => Ok(()),
         Ack::Fail => Err(TestSinkError),
     }
 }
@@ -155,15 +151,11 @@ struct CountingSink {
 }
 
 impl Sink<SharedBatch<String, Cursor>> for CountingSink {
-    type Cursor = Cursor;
     type Error = Infallible;
 
-    async fn deliver(
-        &self,
-        batch: SharedBatch<String, Self::Cursor>,
-    ) -> Result<Self::Cursor, Self::Error> {
+    async fn deliver(&self, batch: SharedBatch<String, Cursor>) -> Result<(), Self::Error> {
         self.records.fetch_add(batch.len(), Ordering::SeqCst);
-        Ok(batch.last().unwrap().cursor.clone())
+        Ok(())
     }
 }
 
@@ -172,15 +164,11 @@ struct OwnedCountingSink {
 }
 
 impl Sink<Batch<String, Cursor>> for OwnedCountingSink {
-    type Cursor = Cursor;
     type Error = Infallible;
 
-    async fn deliver(
-        &self,
-        batch: Batch<String, Self::Cursor>,
-    ) -> Result<Self::Cursor, Self::Error> {
+    async fn deliver(&self, batch: Batch<String, Cursor>) -> Result<(), Self::Error> {
         self.records.fetch_add(batch.len(), Ordering::SeqCst);
-        Ok(batch.last().unwrap().cursor.clone())
+        Ok(())
     }
 }
 
@@ -202,7 +190,7 @@ async fn linear_pipeline_moves_owned_transformed_batches_to_one_sink() {
             .lock()
             .unwrap()
             .iter()
-            .map(|record| record.payload.as_str())
+            .map(String::as_str)
             .collect::<Vec<_>>(),
         vec!["2", "30", "400"]
     );
@@ -255,8 +243,8 @@ async fn cloned_fanout_does_not_require_sync_payloads() {
         .await
         .unwrap();
 
-    assert_eq!(first_records.lock().unwrap()[0].payload.get(), 7);
-    assert_eq!(second_records.lock().unwrap()[0].payload.get(), 7);
+    assert_eq!(first_records.lock().unwrap()[0].get(), 7);
+    assert_eq!(second_records.lock().unwrap()[0].get(), 7);
 }
 
 struct NonClone(u64);
@@ -277,8 +265,8 @@ async fn shared_fanout_does_not_require_clone_payloads() {
         .await
         .unwrap();
 
-    assert_eq!(first_batches.lock().unwrap()[0][0].payload.0, 7);
-    assert_eq!(second_batches.lock().unwrap()[0][0].payload.0, 7);
+    assert_eq!(first_batches.lock().unwrap()[0][0].0, 7);
+    assert_eq!(second_batches.lock().unwrap()[0][0].0, 7);
 }
 
 #[tokio::test]
@@ -319,6 +307,8 @@ async fn fanout_accepts_heterogeneous_array_and_shares_whole_batches() {
     let second = second_batches.lock().unwrap();
     assert_eq!(first.len(), 2);
     assert_eq!(second.len(), 2);
+    assert_eq!(first[0].cursor, Cursor::at(1));
+    assert_eq!(first[1].cursor, Cursor::at(2));
     assert!(Arc::ptr_eq(&first[0], &second[0]));
     assert!(Arc::ptr_eq(&first[1], &second[1]));
 }
@@ -354,15 +344,20 @@ struct StartedSource {
 
 impl Source for StartedSource {
     type Payload = u64;
+    type Position = Cursor;
     type Cursor = Cursor;
     type Error = Infallible;
 
     fn stream(
         &self,
-    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Cursor>, Self::Error>> + Send + '_
+    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_
     {
         self.started.store(true, Ordering::SeqCst);
         stream::empty()
+    }
+
+    fn track(_cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
+        position
     }
 
     async fn commit(&self, _cursor: Self::Cursor) -> Result<(), Self::Error> {
@@ -404,25 +399,20 @@ struct ProbeSink {
 }
 
 impl Sink<SharedBatch<u64, Cursor>> for ProbeSink {
-    type Cursor = Cursor;
     type Error = TestSinkError;
 
-    async fn deliver(
-        &self,
-        batch: SharedBatch<u64, Self::Cursor>,
-    ) -> Result<Self::Cursor, Self::Error> {
-        let cursor = batch.last().unwrap().cursor.clone();
+    async fn deliver(&self, _batch: SharedBatch<u64, Cursor>) -> Result<(), Self::Error> {
         match &self.behavior {
-            ProbeBehavior::Exact => Ok(cursor),
+            ProbeBehavior::Exact => Ok(()),
             ProbeBehavior::Fail => Err(TestSinkError),
             ProbeBehavior::Slow(completed) => {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 completed.store(true, Ordering::SeqCst);
-                Ok(cursor)
+                Ok(())
             }
             ProbeBehavior::Barrier(barrier) => {
                 barrier.wait().await;
-                Ok(cursor)
+                Ok(())
             }
             ProbeBehavior::Panic => panic!("sink panic"),
         }
@@ -512,25 +502,6 @@ async fn fanout_sink_panics_are_reported_and_prevent_commit() {
 }
 
 #[tokio::test]
-async fn cursor_mismatch_prevents_commit() {
-    let (source, committed) = source(vec![1]);
-    let (sink, _) = linear_collector(Ack::Next);
-
-    let result = Pipeline::source(source)
-        .transform(Identity)
-        .sink(sink)
-        .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
-        .run_until(std::future::pending())
-        .await;
-
-    assert!(matches!(
-        result,
-        Err(PipelineError::Sink(DeliveryFailure::Cursor { .. }))
-    ));
-    assert!(committed.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
 async fn sink_failure_prevents_commit() {
     let (source, committed) = source(vec![1]);
     let (sink, _) = linear_collector(Ack::Fail);
@@ -586,18 +557,23 @@ struct FallibleSource {
 
 impl Source for FallibleSource {
     type Payload = u64;
+    type Position = Cursor;
     type Cursor = Cursor;
     type Error = SourceFailure;
 
     fn stream(
         &self,
-    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Cursor>, Self::Error>> + Send + '_
+    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_
     {
         stream::iter(if self.fail_stream {
             vec![Err(SourceFailure)]
         } else {
             vec![Ok(Record::new(Cursor::at(0), 1))]
         })
+    }
+
+    fn track(_cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
+        position
     }
 
     async fn commit(&self, _cursor: Self::Cursor) -> Result<(), Self::Error> {
@@ -660,12 +636,13 @@ struct DelayedSource {
 
 impl Source for DelayedSource {
     type Payload = u64;
+    type Position = Cursor;
     type Cursor = Cursor;
     type Error = Infallible;
 
     fn stream(
         &self,
-    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Cursor>, Self::Error>> + Send + '_
+    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_
     {
         stream::iter(0..3_u64).then(|offset| async move {
             if offset == 1 {
@@ -673,6 +650,10 @@ impl Source for DelayedSource {
             }
             Ok(Record::new(Cursor::at(offset), offset))
         })
+    }
+
+    fn track(_cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
+        position
     }
 
     async fn commit(&self, cursor: Self::Cursor) -> Result<(), Self::Error> {
@@ -709,14 +690,19 @@ struct OpenSource {
 
 impl Source for OpenSource {
     type Payload = u64;
+    type Position = Cursor;
     type Cursor = Cursor;
     type Error = Infallible;
 
     fn stream(
         &self,
-    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Cursor>, Self::Error>> + Send + '_
+    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_
     {
         stream::once(async { Ok(Record::new(Cursor::at(0), 1)) }).chain(stream::pending())
+    }
+
+    fn track(_cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
+        position
     }
 
     async fn commit(&self, cursor: Self::Cursor) -> Result<(), Self::Error> {
@@ -769,12 +755,13 @@ struct PositionedSource {
 
 impl Source for PositionedSource {
     type Payload = ();
+    type Position = Cursor;
     type Cursor = Cursor;
     type Error = Infallible;
 
     fn stream(
         &self,
-    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Cursor>, Self::Error>> + Send + '_
+    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_
     {
         stream::iter(
             self.cursors
@@ -782,6 +769,10 @@ impl Source for PositionedSource {
                 .into_iter()
                 .map(|cursor| Ok(Record::new(cursor, ()))),
         )
+    }
+
+    fn track(_cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
+        position
     }
 
     async fn commit(&self, cursor: Self::Cursor) -> Result<(), Self::Error> {

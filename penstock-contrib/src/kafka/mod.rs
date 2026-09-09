@@ -27,7 +27,7 @@
 //! per-partition offsets only after Penstock reports successful delivery. Configure
 //! `max.poll.interval.ms` above the worst-case time spent transforming and delivering a batch.
 
-use std::{collections::HashMap, future, marker::PhantomData, sync::Arc};
+use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -82,9 +82,17 @@ pub struct KafkaMessage<P> {
 
 /// Absolute next offsets keyed by topic and partition.
 ///
-/// Each record carries a complete snapshot through that point in the consumer stream. The map can
-/// therefore be translated directly into a [`TopicPartitionList`] when a batch is acknowledged.
+/// The source folds the message-local positions in each batch into this map, which translates
+/// directly into a [`TopicPartitionList`] when the batch is delivered.
 pub type KafkaCursor = HashMap<(String, i32), i64>;
+
+/// The next offset for the topic-partition of one consumed message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KafkaPosition {
+    pub topic: String,
+    pub partition: i32,
+    pub next_offset: i64,
+}
 
 /// Kafka source construction, consumption, decoding, or commit failure.
 #[derive(Debug, Error)]
@@ -165,7 +173,7 @@ where
     }
 }
 
-fn advance_cursor<M>(cursor: &mut KafkaCursor, message: &M) -> Result<KafkaCursor, KafkaSourceError>
+fn message_position<M>(message: &M) -> Result<KafkaPosition, KafkaSourceError>
 where
     M: Message + ?Sized,
 {
@@ -177,11 +185,11 @@ where
             partition: message.partition(),
             offset,
         })?;
-    cursor.insert(
-        (message.topic().to_owned(), message.partition()),
+    Ok(KafkaPosition {
+        topic: message.topic().to_owned(),
+        partition: message.partition(),
         next_offset,
-    );
-    Ok(cursor.clone())
+    })
 }
 
 /// Persists successful cursor snapshots to Kafka consumer-group offsets.
@@ -255,15 +263,14 @@ impl<D> KafkaSource<D> {
 
     fn record<P, M>(
         &self,
-        cursor: &mut KafkaCursor,
         source: &M,
         payload: P,
-    ) -> Result<Record<KafkaMessage<P>, KafkaCursor>, KafkaSourceError>
+    ) -> Result<Record<KafkaMessage<P>, KafkaPosition>, KafkaSourceError>
     where
         M: Message + ?Sized,
     {
-        let cursor = advance_cursor(cursor, source)?;
-        Ok(Record::new(cursor, message_with_payload(source, payload)))
+        let position = message_position(source)?;
+        Ok(Record::new(position, message_with_payload(source, payload)))
     }
 
     async fn commit_cursor(&self, cursor: KafkaCursor) -> Result<(), KafkaSourceError> {
@@ -271,25 +278,36 @@ impl<D> KafkaSource<D> {
             .commit(Arc::clone(&self.consumer), cursor)
             .await
     }
+
+    fn track(cursor: Option<KafkaCursor>, position: KafkaPosition) -> KafkaCursor {
+        let mut cursor = cursor.unwrap_or_default();
+        cursor
+            .entry((position.topic, position.partition))
+            .and_modify(|offset| *offset = (*offset).max(position.next_offset))
+            .or_insert(position.next_offset);
+        cursor
+    }
 }
 
 impl Source for KafkaSource<Raw> {
     type Payload = KafkaMessage<Option<Vec<u8>>>;
+    type Position = KafkaPosition;
     type Cursor = KafkaCursor;
     type Error = KafkaSourceError;
 
     fn stream(
         &self,
-    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Cursor>, Self::Error>> + Send + '_
+    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_
     {
-        self.consumer
-            .stream()
-            .scan(KafkaCursor::new(), |cursor, source| {
-                let record = source
-                    .map_err(KafkaSourceError::Kafka)
-                    .and_then(|source| self.record(cursor, &source, raw_payload(&source)));
-                future::ready(Some(record))
-            })
+        self.consumer.stream().map(|source| {
+            source
+                .map_err(KafkaSourceError::Kafka)
+                .and_then(|source| self.record(&source, raw_payload(&source)))
+        })
+    }
+
+    fn track(cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
+        KafkaSource::<Raw>::track(cursor, position)
     }
 
     async fn commit(&self, cursor: Self::Cursor) -> Result<(), Self::Error> {
@@ -302,22 +320,24 @@ where
     T: DeserializeOwned + Send,
 {
     type Payload = KafkaMessage<T>;
+    type Position = KafkaPosition;
     type Cursor = KafkaCursor;
     type Error = KafkaSourceError;
 
     fn stream(
         &self,
-    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Cursor>, Self::Error>> + Send + '_
+    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_
     {
-        self.consumer
-            .stream()
-            .scan(KafkaCursor::new(), |cursor, source| {
-                let record = source.map_err(KafkaSourceError::Kafka).and_then(|source| {
-                    let payload = json_payload(&source)?;
-                    self.record(cursor, &source, payload)
-                });
-                future::ready(Some(record))
+        self.consumer.stream().map(|source| {
+            source.map_err(KafkaSourceError::Kafka).and_then(|source| {
+                let payload = json_payload(&source)?;
+                self.record(&source, payload)
             })
+        })
+    }
+
+    fn track(cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
+        KafkaSource::<Json<T>>::track(cursor, position)
     }
 
     async fn commit(&self, cursor: Self::Cursor) -> Result<(), Self::Error> {
@@ -418,25 +438,26 @@ mod tests {
     }
 
     #[test]
-    fn cursor_snapshots_interleaved_partitions() {
-        let mut cursor = KafkaCursor::new();
-        let first = advance_cursor(&mut cursor, &message_at(0, 4)).unwrap();
-        let second = advance_cursor(&mut cursor, &message_at(1, 9)).unwrap();
-        let third = advance_cursor(&mut cursor, &message_at(0, 5)).unwrap();
+    fn cursor_folds_interleaved_partition_positions() {
+        let cursor = [message_at(0, 4), message_at(1, 9), message_at(0, 5)]
+            .iter()
+            .map(message_position)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .fold(None, |cursor, position| {
+                Some(KafkaSource::<Raw>::track(cursor, position))
+            })
+            .unwrap();
 
-        assert_eq!(first.get(&("events".to_owned(), 0)), Some(&5));
-        assert_eq!(first.get(&("events".to_owned(), 1)), None);
-        assert_eq!(second.get(&("events".to_owned(), 0)), Some(&5));
-        assert_eq!(second.get(&("events".to_owned(), 1)), Some(&10));
-        assert_eq!(third.get(&("events".to_owned(), 0)), Some(&6));
-        assert_eq!(third.get(&("events".to_owned(), 1)), Some(&10));
+        assert_eq!(cursor.get(&("events".to_owned(), 0)), Some(&6));
+        assert_eq!(cursor.get(&("events".to_owned(), 1)), Some(&10));
     }
 
     #[test]
     fn cursor_rejects_exhausted_offsets() {
-        let mut cursor = KafkaCursor::new();
         assert!(matches!(
-            advance_cursor(&mut cursor, &message_at(0, i64::MAX)),
+            message_position(&message_at(0, i64::MAX)),
             Err(KafkaSourceError::OffsetExhausted { .. })
         ));
     }

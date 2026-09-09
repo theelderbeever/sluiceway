@@ -1,14 +1,14 @@
 //! Typed, ordered linear and fanout pipeline runners.
 //!
 //! One consuming transform feeds either a single owned sink or a type-erased fanout of sinks. A
-//! batch is committed only after every sink acknowledges its final cursor, providing at-least-once
-//! delivery.
+//! source folds message positions into one cursor per batch, which is committed only after every
+//! sink succeeds, providing at-least-once delivery.
 //!
 //! Pipelines cannot run until a delivery topology and batch policy are configured:
 //!
 //! ```compile_fail
 //! # use penstock_core::{Identity, Pipeline};
-//! # fn source() -> impl penstock_core::Source<Payload = (), Cursor = (), Error = std::convert::Infallible> { todo!() }
+//! # fn source() -> impl penstock_core::Source<Payload = (), Position = (), Cursor = (), Error = std::convert::Infallible> { todo!() }
 //! # async fn example() {
 //! Pipeline::source(source())
 //!     .transform(Identity)

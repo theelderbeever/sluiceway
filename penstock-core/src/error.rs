@@ -52,22 +52,8 @@ where
 {
     #[error("sink failed")]
     Sink(#[source] E),
-    #[error("sink acknowledged {actual} instead of {expected}")]
-    Cursor { expected: String, actual: String },
     #[error("sink task failed")]
     Task(#[source] tokio::task::JoinError),
-}
-
-impl<E> DeliveryFailure<E>
-where
-    E: Error + 'static,
-{
-    pub(crate) fn cursor(expected: impl fmt::Debug, actual: impl fmt::Debug) -> Self {
-        Self::Cursor {
-            expected: format!("{expected:?}"),
-            actual: format!("{actual:?}"),
-        }
-    }
 }
 
 /// Identifies the pipeline operation that failed.

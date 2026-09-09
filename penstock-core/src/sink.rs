@@ -1,12 +1,59 @@
-use std::{fmt::Debug, future::Future, marker::PhantomData, pin::Pin, sync::Arc};
+use std::{future::Future, marker::PhantomData, ops::Deref, pin::Pin, sync::Arc};
 
 use crate::{ErasedError, Record};
 
-/// One owned batch of transformed records.
-pub type Batch<T, C> = Vec<Record<T, C>>;
+/// One owned batch of transformed items and its source-selected commit cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Batch<T, C> {
+    pub items: Vec<T>,
+    pub cursor: C,
+}
+
+impl<T, C> Batch<T, C> {
+    pub fn new(items: Vec<T>, cursor: C) -> Self {
+        Self { items, cursor }
+    }
+
+    pub fn into_parts(self) -> (Vec<T>, C) {
+        (self.items, self.cursor)
+    }
+
+    pub(crate) fn from_chunk<P, E>(
+        chunk: Vec<Result<Record<T, P>, E>>,
+        mut track: impl FnMut(Option<C>, P) -> C,
+    ) -> Result<Option<Self>, E> {
+        let mut items = Vec::with_capacity(chunk.len());
+        let mut cursor = None;
+
+        for record in chunk {
+            let Record { position, payload } = record?;
+            cursor = Some(track(cursor, position));
+            items.push(payload);
+        }
+
+        Ok(cursor.map(|cursor| Self::new(items, cursor)))
+    }
+}
+
+impl<T, C> Deref for Batch<T, C> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        &self.items
+    }
+}
+
+impl<T, C> IntoIterator for Batch<T, C> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
+    }
+}
 
 /// One immutable batch shared by every sink in shared fanout.
-pub type SharedBatch<T, C> = Arc<[Record<T, C>]>;
+pub type SharedBatch<T, C> = Arc<Batch<T, C>>;
 
 /// Type-state marker selecting cloned fanout batches.
 #[derive(Debug, Default, Clone, Copy)]
@@ -38,30 +85,25 @@ where
     type Input = SharedBatch<T, C>;
 }
 
-/// Durably consumes an input and acknowledges its persisted cursor.
+/// Durably consumes an input.
 pub trait Sink<Input: Send>: Send + Sync {
-    type Cursor: Clone + Eq + Debug + Send + Sync + 'static;
     type Error: std::error::Error + Send + Sync + 'static;
 
-    fn deliver(
-        &self,
-        input: Input,
-    ) -> impl Future<Output = Result<Self::Cursor, Self::Error>> + Send;
+    fn deliver(&self, input: Input) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-trait ErasedSink<Input, C>: Send + Sync {
-    fn deliver(&self, input: Input) -> BoxFuture<'_, Result<C, ErasedError>>;
+trait ErasedSink<Input>: Send + Sync {
+    fn deliver(&self, input: Input) -> BoxFuture<'_, Result<(), ErasedError>>;
 }
 
-impl<Input, C, S> ErasedSink<Input, C> for S
+impl<Input, S> ErasedSink<Input> for S
 where
     Input: Send + 'static,
-    C: Clone + Eq + Debug + Send + Sync + 'static,
-    S: Sink<Input, Cursor = C> + 'static,
+    S: Sink<Input> + 'static,
 {
-    fn deliver(&self, input: Input) -> BoxFuture<'_, Result<C, ErasedError>> {
+    fn deliver(&self, input: Input) -> BoxFuture<'_, Result<(), ErasedError>> {
         Box::pin(async move { Sink::deliver(self, input).await.map_err(ErasedError::new) })
     }
 }
@@ -71,8 +113,10 @@ pub struct BoxSink<T, C, Mode = Shared>
 where
     Mode: FanoutMode<T, C>,
 {
-    inner: Arc<dyn ErasedSink<Mode::Input, C>>,
-    mode: PhantomData<Mode>,
+    inner: Arc<dyn ErasedSink<Mode::Input>>,
+    payload: PhantomData<fn() -> T>,
+    cursor: PhantomData<fn() -> C>,
+    mode: PhantomData<fn() -> Mode>,
 }
 
 impl<T, C, Mode> Clone for BoxSink<T, C, Mode>
@@ -82,6 +126,8 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            payload: PhantomData,
+            cursor: PhantomData,
             mode: PhantomData,
         }
     }
@@ -90,19 +136,20 @@ where
 impl<T, C, Mode> BoxSink<T, C, Mode>
 where
     Mode: FanoutMode<T, C>,
-    C: Clone + Eq + Debug + Send + Sync + 'static,
 {
     pub fn new<S>(sink: S) -> Self
     where
-        S: Sink<Mode::Input, Cursor = C> + 'static,
+        S: Sink<Mode::Input> + 'static,
     {
         Self {
             inner: Arc::new(sink),
+            payload: PhantomData,
+            cursor: PhantomData,
             mode: PhantomData,
         }
     }
 
-    pub(crate) async fn deliver(&self, input: Mode::Input) -> Result<C, ErasedError> {
+    pub(crate) async fn deliver(&self, input: Mode::Input) -> Result<(), ErasedError> {
         self.inner.deliver(input).await
     }
 }
@@ -110,8 +157,8 @@ where
 impl<T, C, S> From<S> for BoxSink<T, C, Cloned>
 where
     T: Send + 'static,
-    C: Clone + Eq + Debug + Send + Sync + 'static,
-    S: Sink<Batch<T, C>, Cursor = C> + 'static,
+    C: Send + 'static,
+    S: Sink<Batch<T, C>> + 'static,
 {
     fn from(sink: S) -> Self {
         Self::new(sink)
@@ -121,8 +168,8 @@ where
 impl<T, C, S> From<S> for BoxSink<T, C, Shared>
 where
     T: Send + Sync + 'static,
-    C: Clone + Eq + Debug + Send + Sync + 'static,
-    S: Sink<SharedBatch<T, C>, Cursor = C> + 'static,
+    C: Send + Sync + 'static,
+    S: Sink<SharedBatch<T, C>> + 'static,
 {
     fn from(sink: S) -> Self {
         Self::new(sink)

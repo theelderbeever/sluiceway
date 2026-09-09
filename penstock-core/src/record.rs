@@ -1,12 +1,12 @@
-/// A payload and the source cursor that can resume after it.
+/// A payload and its source-local position.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Record<T, C> {
-    pub cursor: C,
+pub struct Record<T, P> {
+    pub position: P,
     pub payload: T,
 }
 
-impl<T, C> Record<T, C> {
-    pub fn new(cursor: C, payload: T) -> Self {
-        Self { cursor, payload }
+impl<T, P> Record<T, P> {
+    pub fn new(position: P, payload: T) -> Self {
+        Self { position, payload }
     }
 }

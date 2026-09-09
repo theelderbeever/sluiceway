@@ -24,20 +24,15 @@ struct CollectSink {
 }
 
 impl Sink<Batch<KafkaMessage<Option<Vec<u8>>>, KafkaCursor>> for CollectSink {
-    type Cursor = KafkaCursor;
     type Error = Infallible;
 
     async fn deliver(
         &self,
-        batch: Batch<KafkaMessage<Option<Vec<u8>>>, Self::Cursor>,
-    ) -> Result<Self::Cursor, Self::Error> {
-        let cursor = batch.last().unwrap().cursor.clone();
-        self.messages
-            .lock()
-            .unwrap()
-            .extend(batch.into_iter().map(|record| record.payload));
+        batch: Batch<KafkaMessage<Option<Vec<u8>>>, KafkaCursor>,
+    ) -> Result<(), Self::Error> {
+        self.messages.lock().unwrap().extend(batch);
         self.delivered.notify_one();
-        Ok(cursor)
+        Ok(())
     }
 }
 
@@ -48,13 +43,12 @@ struct RejectBatch;
 struct RejectSink;
 
 impl Sink<Batch<KafkaMessage<Option<Vec<u8>>>, KafkaCursor>> for RejectSink {
-    type Cursor = KafkaCursor;
     type Error = RejectBatch;
 
     async fn deliver(
         &self,
-        _batch: Batch<KafkaMessage<Option<Vec<u8>>>, Self::Cursor>,
-    ) -> Result<Self::Cursor, Self::Error> {
+        _batch: Batch<KafkaMessage<Option<Vec<u8>>>, KafkaCursor>,
+    ) -> Result<(), Self::Error> {
         Err(RejectBatch)
     }
 }
@@ -62,14 +56,13 @@ impl Sink<Batch<KafkaMessage<Option<Vec<u8>>>, KafkaCursor>> for RejectSink {
 struct JsonSink;
 
 impl Sink<Batch<KafkaMessage<Vec<u64>>, KafkaCursor>> for JsonSink {
-    type Cursor = KafkaCursor;
     type Error = Infallible;
 
     async fn deliver(
         &self,
-        batch: Batch<KafkaMessage<Vec<u64>>, Self::Cursor>,
-    ) -> Result<Self::Cursor, Self::Error> {
-        Ok(batch.last().unwrap().cursor.clone())
+        _batch: Batch<KafkaMessage<Vec<u64>>, KafkaCursor>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
 

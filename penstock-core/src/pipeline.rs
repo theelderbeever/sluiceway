@@ -1,6 +1,4 @@
-use std::{
-    fmt::Debug, future::Future, marker::PhantomData, num::NonZeroUsize, sync::Arc, time::Duration,
-};
+use std::{future::Future, marker::PhantomData, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use tokio::task::JoinSet;
@@ -193,9 +191,8 @@ where
 impl<So, Tr, Si> LinearPipeline<So, Tr, Si, Batched>
 where
     So: Source,
-    So::Cursor: Clone + Eq + Debug + Send + Sync + 'static,
     Tr: Transform<So::Payload>,
-    Si: Sink<Batch<Tr::Out, So::Cursor>, Cursor = So::Cursor>,
+    Si: Sink<Batch<Tr::Out, So::Cursor>>,
 {
     pub async fn run_until(
         self,
@@ -207,12 +204,12 @@ where
             .stream()
             .take_until(shutdown)
             .map(|item| async move {
-                let Record { cursor, payload } = item.map_err(PipelineError::Source)?;
+                let Record { position, payload } = item.map_err(PipelineError::Source)?;
                 let payload = transform
                     .apply(payload)
                     .await
                     .map_err(PipelineError::Transform)?;
-                Ok(Record::new(cursor, payload))
+                Ok(Record::new(position, payload))
             })
             .buffered(transform.max_concurrency().get());
         tokio::pin!(records);
@@ -224,25 +221,18 @@ where
         tokio::pin!(chunks);
 
         while let Some(chunk) = chunks.next().await {
-            let records: Batch<Tr::Out, So::Cursor> =
-                chunk.into_iter().collect::<Result<_, _>>()?;
-            let Some(expected) = records.last().map(|record| record.cursor.clone()) else {
+            let Some(batch) = Batch::from_chunk(chunk, So::track)? else {
                 continue;
             };
+            let cursor = batch.cursor.clone();
 
-            let actual = self
-                .sink
-                .deliver(records)
+            self.sink
+                .deliver(batch)
                 .await
                 .map_err(|error| PipelineError::Sink(DeliveryFailure::Sink(error)))?;
-            if actual != expected {
-                return Err(PipelineError::Sink(DeliveryFailure::cursor(
-                    &expected, actual,
-                )));
-            }
 
             self.source
-                .commit(expected)
+                .commit(cursor)
                 .await
                 .map_err(PipelineError::Commit)?;
         }
@@ -261,6 +251,27 @@ where
     transform: Tr,
     sinks: Vec<BoxSink<Tr::Out, So::Cursor, Mode>>,
     strategy: St,
+}
+
+impl<So, Tr, Mode, St> FanoutPipeline<So, Tr, Mode, St>
+where
+    So: Source,
+    Tr: Transform<So::Payload>,
+    Mode: FanoutMode<Tr::Out, So::Cursor>,
+{
+    async fn drain(
+        tasks: &mut JoinSet<Result<(), ErasedError>>,
+    ) -> Vec<DeliveryFailure<ErasedError>> {
+        let mut failures = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(DeliveryFailure::Sink(error)),
+                Err(error) => failures.push(DeliveryFailure::Task(error)),
+            }
+        }
+        failures
+    }
 }
 
 impl<So, Tr, Mode> FanoutPipeline<So, Tr, Mode>
@@ -282,7 +293,6 @@ where
 impl<So, Tr> FanoutPipeline<So, Tr, Cloned, Batched>
 where
     So: Source,
-    So::Cursor: Clone + Eq + Debug + Send + Sync + 'static,
     Tr: Transform<So::Payload>,
     Tr::Out: Clone + Send + 'static,
 {
@@ -300,12 +310,12 @@ where
             .stream()
             .take_until(shutdown)
             .map(|item| async move {
-                let Record { cursor, payload } = item.map_err(PipelineError::Source)?;
+                let Record { position, payload } = item.map_err(PipelineError::Source)?;
                 let payload = transform
                     .apply(payload)
                     .await
                     .map_err(PipelineError::Transform)?;
-                Ok(Record::new(cursor, payload))
+                Ok(Record::new(position, payload))
             })
             .buffered(transform.max_concurrency().get());
         tokio::pin!(records);
@@ -317,35 +327,31 @@ where
         tokio::pin!(chunks);
 
         while let Some(chunk) = chunks.next().await {
-            let records: Batch<Tr::Out, So::Cursor> =
-                chunk.into_iter().collect::<Result<_, _>>()?;
-            let Some(expected) = records.last().map(|record| record.cursor.clone()) else {
+            let Some(batch) = Batch::from_chunk(chunk, So::track)? else {
                 continue;
             };
-            let mut original = Some(records);
-            let last = self.sinks.len() - 1;
+            let cursor = batch.cursor.clone();
             let mut tasks = JoinSet::new();
+            let (last_sink, preceding_sinks) = self
+                .sinks
+                .split_last()
+                .expect("empty fanout is rejected before starting the source");
 
-            for (index, sink) in self.sinks.iter().enumerate() {
+            for sink in preceding_sinks {
                 let sink = sink.clone();
-                let batch = if index == last {
-                    original.take().expect("the final sink receives the batch")
-                } else {
-                    original
-                        .as_ref()
-                        .expect("the original batch remains until the final sink")
-                        .clone()
-                };
+                let batch = batch.clone();
                 tasks.spawn(async move { sink.deliver(batch).await });
             }
+            let sink = last_sink.clone();
+            tasks.spawn(async move { sink.deliver(batch).await });
 
-            let failures = drain_fanout(&mut tasks, &expected).await;
+            let failures = Self::drain(&mut tasks).await;
             if !failures.is_empty() {
                 return Err(PipelineError::Sinks(failures));
             }
 
             self.source
-                .commit(expected)
+                .commit(cursor)
                 .await
                 .map_err(PipelineError::Commit)?;
         }
@@ -356,7 +362,6 @@ where
 impl<So, Tr> FanoutPipeline<So, Tr, Shared, Batched>
 where
     So: Source,
-    So::Cursor: Clone + Eq + Debug + Send + Sync + 'static,
     Tr: Transform<So::Payload>,
     Tr::Out: Send + Sync + 'static,
 {
@@ -374,12 +379,12 @@ where
             .stream()
             .take_until(shutdown)
             .map(|item| async move {
-                let Record { cursor, payload } = item.map_err(PipelineError::Source)?;
+                let Record { position, payload } = item.map_err(PipelineError::Source)?;
                 let payload = transform
                     .apply(payload)
                     .await
                     .map_err(PipelineError::Transform)?;
-                Ok(Record::new(cursor, payload))
+                Ok(Record::new(position, payload))
             })
             .buffered(transform.max_concurrency().get());
         tokio::pin!(records);
@@ -391,12 +396,11 @@ where
         tokio::pin!(chunks);
 
         while let Some(chunk) = chunks.next().await {
-            let records: Batch<Tr::Out, So::Cursor> =
-                chunk.into_iter().collect::<Result<_, _>>()?;
-            let Some(expected) = records.last().map(|record| record.cursor.clone()) else {
+            let Some(batch) = Batch::from_chunk(chunk, So::track)? else {
                 continue;
             };
-            let batch: SharedBatch<Tr::Out, So::Cursor> = Arc::from(records);
+            let cursor = batch.cursor.clone();
+            let batch: SharedBatch<Tr::Out, So::Cursor> = Arc::new(batch);
             let mut tasks = JoinSet::new();
 
             for sink in &self.sinks {
@@ -405,35 +409,16 @@ where
                 tasks.spawn(async move { sink.deliver(batch).await });
             }
 
-            let failures = drain_fanout(&mut tasks, &expected).await;
+            let failures = Self::drain(&mut tasks).await;
             if !failures.is_empty() {
                 return Err(PipelineError::Sinks(failures));
             }
 
             self.source
-                .commit(expected)
+                .commit(cursor)
                 .await
                 .map_err(PipelineError::Commit)?;
         }
         Ok(())
     }
-}
-
-async fn drain_fanout<C>(
-    tasks: &mut JoinSet<Result<C, ErasedError>>,
-    expected: &C,
-) -> Vec<DeliveryFailure<ErasedError>>
-where
-    C: Eq + Debug + 'static,
-{
-    let mut failures = Vec::new();
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok(Ok(actual)) if actual == *expected => {}
-            Ok(Ok(actual)) => failures.push(DeliveryFailure::cursor(expected, actual)),
-            Ok(Err(error)) => failures.push(DeliveryFailure::Sink(error)),
-            Err(error) => failures.push(DeliveryFailure::Task(error)),
-        }
-    }
-    failures
 }
