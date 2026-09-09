@@ -34,4 +34,4 @@ pub use pipeline::{
 pub use record::Record;
 pub use sink::{Batch, BoxSink, Cloned, FanoutMode, Shared, SharedBatch, Sink};
 pub use source::Source;
-pub use transform::{Identity, Transform, Transformer};
+pub use transform::{Identity, SpawnError, Transform, Transformer};
