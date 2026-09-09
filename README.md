@@ -19,6 +19,7 @@ Applications import the `penstock` facade. The low-level engine lives in `pensto
 | `penstock` | Public facade and feature-gated adapter re-exports |
 | `penstock-core` | Records, sources, transforms, sinks, checkpoints, and runners |
 | `penstock-io` | Filesystem, object-store, and SQL checkpoint adapters |
+| `penstock-contrib` | Feature-gated external source and sink integrations |
 
 A linear sink owns and consumes each batch:
 
@@ -84,3 +85,8 @@ Checkpoint adapters are available through facade features. `io` enables local fi
 `object-store` adds caller-configured object stores, and `sql-postgres`, `sql-mysql`, and
 `sql-sqlite` add SQLx-backed stores. Adapters encode cursors as JSON, so structured cursor types
 can be used when they implement Serde's `Serialize` and `DeserializeOwned` traits.
+
+Kafka-compatible consumers, including Redpanda, are available from the separate
+`penstock-contrib` crate with its `kafka` feature. Raw and strict Serde JSON modes preserve Kafka
+message metadata and commit consumer-group offsets only after the pipeline's sinks acknowledge a
+batch.

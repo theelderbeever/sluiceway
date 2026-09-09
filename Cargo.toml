@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "penstock",
+    "penstock-contrib",
     "penstock-core",
     "penstock-io",
 ]
@@ -16,7 +17,9 @@ futures-core = "0.3.33"
 futures-util = { version = "0.3.33", default-features = false, features = ["async-await", "std"] }
 object_store = "0.14.1"
 penstock-core = { version = "0.1.0", path = "penstock-core" }
+penstock-contrib = { version = "0.1.0", path = "penstock-contrib" }
 penstock-io = { version = "0.1.0", path = "penstock-io", default-features = false }
+rdkafka = { version = "0.39.0", default-features = false, features = ["cmake-build", "libz", "ssl", "tokio"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sqlx-core = { version = "=0.8.6", default-features = false }

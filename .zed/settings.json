@@ -1,0 +1,68 @@
+{
+  "languages": {
+    "TOML": {
+      "format_on_save": "on"
+    },
+    "Python": {
+      "language_servers": ["!pyrefly", "!basedpyright", "!pylsp", "ruff", "ty"],
+
+      "format_on_save": "on",
+
+      "formatter": [
+        { "code_action": "source.fixAll.ruff" },
+        { "code_action": "source.organizeImports.ruff" },
+        {
+          "language_server": {
+            "name": "ruff",
+          },
+        },
+      ],
+    },
+  },
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "cargo": {
+          "features": "all",
+        },
+      },
+    },
+    "basedpyright": {
+      "settings": {
+        "basedpyright.analysis": {
+          "diagnosticMode": "workspace",
+          "inlayHints": {
+            "callArgumentNames": false,
+          },
+        },
+      },
+    },
+    "ty": {
+      "initialization_options": {
+        "logLevel": "debug",
+      },
+      "settings": {
+        "diagnosticMode": "workspace",
+        "inlayHints": {
+          "callArgumentNames": true,
+          "variableTypes": true,
+        },
+      },
+    },
+    "ruff": {
+      "settings": {
+        "diagnosticMode": "workspace",
+      },
+      "initialization_options": {
+        "settings": {
+          "diagnosticMode": "workspace",
+          "organizeImports": true,
+          "lineLength": 88,
+          "lint": {
+            "extendSelect": ["I"],
+          },
+        },
+      },
+    },
+  }
+}

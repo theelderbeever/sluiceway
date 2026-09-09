@@ -1,0 +1,34 @@
+[package]
+name = "penstock-contrib"
+description = "Optional source and sink integrations for Penstock pipelines"
+edition.workspace = true
+version.workspace = true
+
+[features]
+default = []
+kafka = [
+    "dep:futures-core",
+    "dep:futures-util",
+    "dep:penstock-core",
+    "dep:rdkafka",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:thiserror",
+    "dep:tokio",
+]
+
+[dependencies]
+futures-core = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+penstock-core = { workspace = true, optional = true }
+rdkafka = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt", "sync"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true
