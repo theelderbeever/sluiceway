@@ -4,9 +4,14 @@ description = "Core traits and runners for Penstock linear and fanout pipelines"
 edition.workspace = true
 version.workspace = true
 
+[features]
+default = []
+metrics = ["dep:metrics"]
+
 [dependencies]
 futures-core.workspace = true
 futures-util.workspace = true
+metrics = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tokio-stream.workspace = true

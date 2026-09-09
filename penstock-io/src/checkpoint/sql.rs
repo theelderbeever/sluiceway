@@ -1,4 +1,4 @@
-use penstock_core::CheckpointStore;
+use penstock_core::{CheckpointStore, PipelineId};
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx_core::{database::Database, pool::Pool};
 use thiserror::Error;
@@ -27,7 +27,7 @@ pub enum SqlCheckpointError {
 #[derive(Debug, Clone)]
 pub struct SqlCheckpoint<DB: Database> {
     pool: Pool<DB>,
-    pipeline_id: String,
+    pipeline_id: PipelineId,
     table: String,
     #[cfg(feature = "sql-postgres")]
     schema: String,
@@ -36,17 +36,20 @@ pub struct SqlCheckpoint<DB: Database> {
 impl<DB: Database> SqlCheckpoint<DB> {
     /// Construct a checkpoint without performing any DDL.
     pub fn new(pool: Pool<DB>, pipeline_id: impl Into<String>) -> Result<Self, SqlCheckpointError> {
-        let pipeline_id = pipeline_id.into();
-        if pipeline_id.is_empty() || pipeline_id.len() > 255 {
-            return Err(SqlCheckpointError::InvalidPipelineId);
-        }
-        Ok(Self {
+        let pipeline_id =
+            PipelineId::new(pipeline_id).map_err(|_| SqlCheckpointError::InvalidPipelineId)?;
+        Ok(Self::with_id(pool, pipeline_id))
+    }
+
+    /// Construct a checkpoint from an already validated pipeline identity.
+    pub fn with_id(pool: Pool<DB>, pipeline_id: PipelineId) -> Self {
+        Self {
             pool,
             pipeline_id,
             table: DEFAULT_TABLE.to_owned(),
             #[cfg(feature = "sql-postgres")]
             schema: DEFAULT_POSTGRES_SCHEMA.to_owned(),
-        })
+        }
     }
 
     /// Override the default `checkpoints` table.
@@ -60,7 +63,7 @@ impl<DB: Database> SqlCheckpoint<DB> {
     }
 
     pub fn pipeline_id(&self) -> &str {
-        &self.pipeline_id
+        self.pipeline_id.as_str()
     }
 }
 
@@ -132,7 +135,7 @@ where
             "SELECT \"cursor\" FROM {} WHERE \"pipeline_id\" = $1",
             self.qualified_table()
         ))
-        .bind(&self.pipeline_id)
+        .bind(self.pipeline_id.as_str())
         .fetch_optional(&self.pool)
         .await?;
         cursor.map(decode_cursor).transpose()
@@ -145,7 +148,7 @@ where
              ON CONFLICT (\"pipeline_id\") DO UPDATE SET \"cursor\" = EXCLUDED.\"cursor\"",
             self.qualified_table()
         ))
-        .bind(&self.pipeline_id)
+        .bind(self.pipeline_id.as_str())
         .bind(cursor)
         .execute(&self.pool)
         .await?;
@@ -189,7 +192,7 @@ where
             "SELECT `cursor` FROM {} WHERE `pipeline_id` = ?",
             self.quoted_table()
         ))
-        .bind(&self.pipeline_id)
+        .bind(self.pipeline_id.as_str())
         .fetch_optional(&self.pool)
         .await?;
         cursor.map(decode_cursor).transpose()
@@ -202,7 +205,7 @@ where
              ON DUPLICATE KEY UPDATE `cursor` = VALUES(`cursor`)",
             self.quoted_table()
         ))
-        .bind(&self.pipeline_id)
+        .bind(self.pipeline_id.as_str())
         .bind(cursor)
         .execute(&self.pool)
         .await?;
@@ -246,7 +249,7 @@ where
             "SELECT \"cursor\" FROM {} WHERE \"pipeline_id\" = ?",
             self.quoted_table()
         ))
-        .bind(&self.pipeline_id)
+        .bind(self.pipeline_id.as_str())
         .fetch_optional(&self.pool)
         .await?;
         cursor.map(decode_cursor).transpose()
@@ -259,7 +262,7 @@ where
              ON CONFLICT (\"pipeline_id\") DO UPDATE SET \"cursor\" = EXCLUDED.\"cursor\"",
             self.quoted_table()
         ))
-        .bind(&self.pipeline_id)
+        .bind(self.pipeline_id.as_str())
         .bind(cursor)
         .execute(&self.pool)
         .await?;

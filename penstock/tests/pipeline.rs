@@ -12,7 +12,7 @@ use futures_core::Stream;
 use futures_util::{StreamExt, stream};
 use penstock::{
     Batch, BatchPolicy, BoxSink, CheckpointStore, DeliveryFailure, Identity, NoCheckpoint,
-    Pipeline, PipelineError, Record, SharedBatch, Sink, Source,
+    Pipeline, PipelineError, PipelineId, Record, SharedBatch, Sink, Source,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +178,7 @@ async fn linear_pipeline_moves_owned_transformed_batches_to_one_sink() {
     let (sink, records) = linear_collector(Ack::Exact);
 
     Pipeline::source(source)
+        .id(PipelineId::new("linear-test").unwrap())
         .transform(|number: u64| async move { Ok::<_, Infallible>(number.to_string()) })
         .sink(sink)
         .batched(BatchPolicy::try_new(2, Duration::from_secs(1)).unwrap())

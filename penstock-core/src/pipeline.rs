@@ -5,7 +5,7 @@ use tokio::task::JoinSet;
 
 use crate::{
     Batch, BatchConfigError, BoxSink, Cloned, DeliveryFailure, ErasedError, FanoutMode,
-    PipelineError, Record, Shared, SharedBatch, Sink, Source, Transform,
+    PipelineError, PipelineId, Record, Shared, SharedBatch, Sink, Source, Transform, telemetry,
 };
 
 /// Type-state marker for a pipeline stage that has not been configured.
@@ -48,6 +48,7 @@ impl BatchPolicy {
 
 /// A source and its consuming transform, before delivery topology is selected.
 pub struct Pipeline<So, Tr = Unset> {
+    id: Option<PipelineId>,
     source: So,
     transform: Tr,
 }
@@ -55,6 +56,7 @@ pub struct Pipeline<So, Tr = Unset> {
 impl<So: Source> Pipeline<So> {
     pub fn source(source: So) -> Self {
         Self {
+            id: None,
             source,
             transform: Unset,
         }
@@ -65,9 +67,18 @@ impl<So: Source> Pipeline<So> {
         Tr: Transform<So::Payload>,
     {
         Pipeline {
+            id: self.id,
             source: self.source,
             transform,
         }
+    }
+}
+
+impl<So, Tr> Pipeline<So, Tr> {
+    /// Attach a stable identity used to correlate this pipeline's metrics and checkpoints.
+    pub fn id(mut self, id: PipelineId) -> Self {
+        self.id = Some(id);
+        self
     }
 }
 
@@ -79,6 +90,7 @@ where
     /// Select linear delivery. Transformed values remain owned and are consumed by one sink.
     pub fn sink<Si>(self, sink: Si) -> LinearPipeline<So, Tr, Si> {
         LinearPipeline {
+            id: self.id,
             source: self.source,
             transform: self.transform,
             sink,
@@ -89,6 +101,7 @@ where
     /// Begin configuring a fanout delivery topology.
     pub fn fanout(self) -> FanoutBuilder<So, Tr> {
         FanoutBuilder {
+            id: self.id,
             source: self.source,
             transform: self.transform,
             mode: PhantomData,
@@ -98,6 +111,7 @@ where
 
 /// A fanout builder requiring an ownership mode before sinks can be attached.
 pub struct FanoutBuilder<So, Tr, Mode = Unset> {
+    id: Option<PipelineId>,
     source: So,
     transform: Tr,
     mode: PhantomData<Mode>,
@@ -111,6 +125,7 @@ where
     /// Give every sink its own owned clone of each batch.
     pub fn cloned(self) -> FanoutBuilder<So, Tr, Cloned> {
         FanoutBuilder {
+            id: self.id,
             source: self.source,
             transform: self.transform,
             mode: PhantomData,
@@ -120,6 +135,7 @@ where
     /// Give every sink the same immutable, reference-counted batch.
     pub fn shared(self) -> FanoutBuilder<So, Tr, Shared> {
         FanoutBuilder {
+            id: self.id,
             source: self.source,
             transform: self.transform,
             mode: PhantomData,
@@ -138,6 +154,7 @@ where
         I: IntoIterator<Item = BoxSink<Tr::Out, So::Cursor, Cloned>>,
     {
         FanoutPipeline {
+            id: self.id,
             source: self.source,
             transform: self.transform,
             sinks: sinks.into_iter().collect(),
@@ -157,6 +174,7 @@ where
         I: IntoIterator<Item = BoxSink<Tr::Out, So::Cursor, Shared>>,
     {
         FanoutPipeline {
+            id: self.id,
             source: self.source,
             transform: self.transform,
             sinks: sinks.into_iter().collect(),
@@ -167,6 +185,7 @@ where
 
 /// A pipeline that moves each transformed batch into one sink.
 pub struct LinearPipeline<So, Tr, Si, St = Unset> {
+    id: Option<PipelineId>,
     source: So,
     transform: Tr,
     sink: Si,
@@ -180,6 +199,7 @@ where
 {
     pub fn batched(self, policy: BatchPolicy) -> LinearPipeline<So, Tr, Si, Batched> {
         LinearPipeline {
+            id: self.id,
             source: self.source,
             transform: self.transform,
             sink: self.sink,
@@ -198,18 +218,29 @@ where
         self,
         shutdown: impl Future<Output = ()> + Send,
     ) -> Result<(), PipelineError<So::Error, Tr::Error, Si::Error>> {
+        const TOPOLOGY: &str = "linear";
+        let pipeline_id = self.id.clone().unwrap_or_else(PipelineId::unnamed);
+        let _run = telemetry::RunGuard::new(TOPOLOGY, &pipeline_id);
         let transform = &self.transform;
         let records = self
             .source
             .stream()
             .take_until(shutdown)
-            .map(|item| async move {
-                let Record { position, payload } = item.map_err(PipelineError::Source)?;
-                let payload = transform
-                    .apply(payload)
-                    .await
-                    .map_err(PipelineError::Transform)?;
-                Ok(Record::new(position, payload))
+            .map(|item| {
+                let pipeline_id = pipeline_id.clone();
+                async move {
+                    let Record { position, payload } = item.map_err(|error| {
+                        telemetry::error(TOPOLOGY, &pipeline_id, "source");
+                        PipelineError::Source(error)
+                    })?;
+                    let _timer = telemetry::StageTimer::new(TOPOLOGY, "transform", &pipeline_id);
+                    let payload = transform.apply(payload).await.map_err(|error| {
+                        telemetry::error(TOPOLOGY, &pipeline_id, "transform");
+                        PipelineError::Transform(error)
+                    })?;
+                    telemetry::record(TOPOLOGY, &pipeline_id);
+                    Ok(Record::new(position, payload))
+                }
             })
             .buffered(transform.max_concurrency().get());
         tokio::pin!(records);
@@ -224,17 +255,28 @@ where
             let Some(batch) = Batch::from_chunk(chunk, So::track)? else {
                 continue;
             };
+            telemetry::batch(TOPOLOGY, &pipeline_id, batch.len());
             let cursor = batch.cursor.clone();
 
-            self.sink
-                .deliver(batch)
-                .await
-                .map_err(|error| PipelineError::Sink(DeliveryFailure::Sink(error)))?;
+            let delivery = {
+                let _timer = telemetry::StageTimer::new(TOPOLOGY, "sink", &pipeline_id);
+                self.sink.deliver(batch).await
+            };
+            telemetry::sink_delivery(TOPOLOGY, &pipeline_id, delivery.is_ok());
+            delivery.map_err(|error| {
+                telemetry::error(TOPOLOGY, &pipeline_id, "sink");
+                PipelineError::Sink(DeliveryFailure::Sink(error))
+            })?;
 
-            self.source
-                .commit(cursor)
-                .await
-                .map_err(PipelineError::Commit)?;
+            let commit = {
+                let _timer = telemetry::StageTimer::new(TOPOLOGY, "commit", &pipeline_id);
+                self.source.commit(cursor).await
+            };
+            telemetry::commit(TOPOLOGY, &pipeline_id, commit.is_ok());
+            commit.map_err(|error| {
+                telemetry::error(TOPOLOGY, &pipeline_id, "commit");
+                PipelineError::Commit(error)
+            })?;
         }
         Ok(())
     }
@@ -247,6 +289,7 @@ where
     Tr: Transform<So::Payload>,
     Mode: FanoutMode<Tr::Out, So::Cursor>,
 {
+    id: Option<PipelineId>,
     source: So,
     transform: Tr,
     sinks: Vec<BoxSink<Tr::Out, So::Cursor, Mode>>,
@@ -261,13 +304,23 @@ where
 {
     async fn drain(
         tasks: &mut JoinSet<Result<(), ErasedError>>,
+        topology: &'static str,
+        pipeline_id: &PipelineId,
     ) -> Vec<DeliveryFailure<ErasedError>> {
         let mut failures = Vec::new();
         while let Some(joined) = tasks.join_next().await {
             match joined {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => failures.push(DeliveryFailure::Sink(error)),
-                Err(error) => failures.push(DeliveryFailure::Task(error)),
+                Ok(Ok(())) => telemetry::sink_delivery(topology, pipeline_id, true),
+                Ok(Err(error)) => {
+                    telemetry::sink_delivery(topology, pipeline_id, false);
+                    telemetry::error(topology, pipeline_id, "sink");
+                    failures.push(DeliveryFailure::Sink(error));
+                }
+                Err(error) => {
+                    telemetry::sink_delivery(topology, pipeline_id, false);
+                    telemetry::error(topology, pipeline_id, "sink_task");
+                    failures.push(DeliveryFailure::Task(error));
+                }
             }
         }
         failures
@@ -282,6 +335,7 @@ where
 {
     pub fn batched(self, policy: BatchPolicy) -> FanoutPipeline<So, Tr, Mode, Batched> {
         FanoutPipeline {
+            id: self.id,
             source: self.source,
             transform: self.transform,
             sinks: self.sinks,
@@ -300,7 +354,11 @@ where
         self,
         shutdown: impl Future<Output = ()> + Send,
     ) -> Result<(), PipelineError<So::Error, Tr::Error, ErasedError>> {
+        const TOPOLOGY: &str = "fanout_cloned";
+        let pipeline_id = self.id.clone().unwrap_or_else(PipelineId::unnamed);
+        let _run = telemetry::RunGuard::new(TOPOLOGY, &pipeline_id);
         if self.sinks.is_empty() {
+            telemetry::error(TOPOLOGY, &pipeline_id, "configuration");
             return Err(PipelineError::NoSinks);
         }
 
@@ -309,13 +367,21 @@ where
             .source
             .stream()
             .take_until(shutdown)
-            .map(|item| async move {
-                let Record { position, payload } = item.map_err(PipelineError::Source)?;
-                let payload = transform
-                    .apply(payload)
-                    .await
-                    .map_err(PipelineError::Transform)?;
-                Ok(Record::new(position, payload))
+            .map(|item| {
+                let pipeline_id = pipeline_id.clone();
+                async move {
+                    let Record { position, payload } = item.map_err(|error| {
+                        telemetry::error(TOPOLOGY, &pipeline_id, "source");
+                        PipelineError::Source(error)
+                    })?;
+                    let _timer = telemetry::StageTimer::new(TOPOLOGY, "transform", &pipeline_id);
+                    let payload = transform.apply(payload).await.map_err(|error| {
+                        telemetry::error(TOPOLOGY, &pipeline_id, "transform");
+                        PipelineError::Transform(error)
+                    })?;
+                    telemetry::record(TOPOLOGY, &pipeline_id);
+                    Ok(Record::new(position, payload))
+                }
             })
             .buffered(transform.max_concurrency().get());
         tokio::pin!(records);
@@ -330,6 +396,7 @@ where
             let Some(batch) = Batch::from_chunk(chunk, So::track)? else {
                 continue;
             };
+            telemetry::batch(TOPOLOGY, &pipeline_id, batch.len());
             let cursor = batch.cursor.clone();
             let mut tasks = JoinSet::new();
             let (last_sink, preceding_sinks) = self
@@ -340,20 +407,34 @@ where
             for sink in preceding_sinks {
                 let sink = sink.clone();
                 let batch = batch.clone();
-                tasks.spawn(async move { sink.deliver(batch).await });
+                let delivery_pipeline_id = pipeline_id.clone();
+                tasks.spawn(async move {
+                    let _timer =
+                        telemetry::StageTimer::new(TOPOLOGY, "sink", &delivery_pipeline_id);
+                    sink.deliver(batch).await
+                });
             }
             let sink = last_sink.clone();
-            tasks.spawn(async move { sink.deliver(batch).await });
+            let delivery_pipeline_id = pipeline_id.clone();
+            tasks.spawn(async move {
+                let _timer = telemetry::StageTimer::new(TOPOLOGY, "sink", &delivery_pipeline_id);
+                sink.deliver(batch).await
+            });
 
-            let failures = Self::drain(&mut tasks).await;
+            let failures = Self::drain(&mut tasks, TOPOLOGY, &pipeline_id).await;
             if !failures.is_empty() {
                 return Err(PipelineError::Sinks(failures));
             }
 
-            self.source
-                .commit(cursor)
-                .await
-                .map_err(PipelineError::Commit)?;
+            let commit = {
+                let _timer = telemetry::StageTimer::new(TOPOLOGY, "commit", &pipeline_id);
+                self.source.commit(cursor).await
+            };
+            telemetry::commit(TOPOLOGY, &pipeline_id, commit.is_ok());
+            commit.map_err(|error| {
+                telemetry::error(TOPOLOGY, &pipeline_id, "commit");
+                PipelineError::Commit(error)
+            })?;
         }
         Ok(())
     }
@@ -369,7 +450,11 @@ where
         self,
         shutdown: impl Future<Output = ()> + Send,
     ) -> Result<(), PipelineError<So::Error, Tr::Error, ErasedError>> {
+        const TOPOLOGY: &str = "fanout_shared";
+        let pipeline_id = self.id.clone().unwrap_or_else(PipelineId::unnamed);
+        let _run = telemetry::RunGuard::new(TOPOLOGY, &pipeline_id);
         if self.sinks.is_empty() {
+            telemetry::error(TOPOLOGY, &pipeline_id, "configuration");
             return Err(PipelineError::NoSinks);
         }
 
@@ -378,13 +463,21 @@ where
             .source
             .stream()
             .take_until(shutdown)
-            .map(|item| async move {
-                let Record { position, payload } = item.map_err(PipelineError::Source)?;
-                let payload = transform
-                    .apply(payload)
-                    .await
-                    .map_err(PipelineError::Transform)?;
-                Ok(Record::new(position, payload))
+            .map(|item| {
+                let pipeline_id = pipeline_id.clone();
+                async move {
+                    let Record { position, payload } = item.map_err(|error| {
+                        telemetry::error(TOPOLOGY, &pipeline_id, "source");
+                        PipelineError::Source(error)
+                    })?;
+                    let _timer = telemetry::StageTimer::new(TOPOLOGY, "transform", &pipeline_id);
+                    let payload = transform.apply(payload).await.map_err(|error| {
+                        telemetry::error(TOPOLOGY, &pipeline_id, "transform");
+                        PipelineError::Transform(error)
+                    })?;
+                    telemetry::record(TOPOLOGY, &pipeline_id);
+                    Ok(Record::new(position, payload))
+                }
             })
             .buffered(transform.max_concurrency().get());
         tokio::pin!(records);
@@ -399,6 +492,7 @@ where
             let Some(batch) = Batch::from_chunk(chunk, So::track)? else {
                 continue;
             };
+            telemetry::batch(TOPOLOGY, &pipeline_id, batch.len());
             let cursor = batch.cursor.clone();
             let batch: SharedBatch<Tr::Out, So::Cursor> = Arc::new(batch);
             let mut tasks = JoinSet::new();
@@ -406,18 +500,28 @@ where
             for sink in &self.sinks {
                 let sink = sink.clone();
                 let batch = Arc::clone(&batch);
-                tasks.spawn(async move { sink.deliver(batch).await });
+                let delivery_pipeline_id = pipeline_id.clone();
+                tasks.spawn(async move {
+                    let _timer =
+                        telemetry::StageTimer::new(TOPOLOGY, "sink", &delivery_pipeline_id);
+                    sink.deliver(batch).await
+                });
             }
 
-            let failures = Self::drain(&mut tasks).await;
+            let failures = Self::drain(&mut tasks, TOPOLOGY, &pipeline_id).await;
             if !failures.is_empty() {
                 return Err(PipelineError::Sinks(failures));
             }
 
-            self.source
-                .commit(cursor)
-                .await
-                .map_err(PipelineError::Commit)?;
+            let commit = {
+                let _timer = telemetry::StageTimer::new(TOPOLOGY, "commit", &pipeline_id);
+                self.source.commit(cursor).await
+            };
+            telemetry::commit(TOPOLOGY, &pipeline_id, commit.is_ok());
+            commit.map_err(|error| {
+                telemetry::error(TOPOLOGY, &pipeline_id, "commit");
+                PipelineError::Commit(error)
+            })?;
         }
         Ok(())
     }

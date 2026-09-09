@@ -32,7 +32,7 @@ A linear sink owns and consumes each batch:
 
 ```rust,no_run
 use std::{convert::Infallible, time::Duration};
-use penstock::{Batch, BatchPolicy, Pipeline, Sink};
+use penstock::{Batch, BatchPolicy, Pipeline, PipelineId, Sink};
 
 # async fn run<S, K>(source: S, sink: K) -> Result<(), Box<dyn std::error::Error>>
 # where
@@ -41,6 +41,7 @@ use penstock::{Batch, BatchPolicy, Pipeline, Sink};
 #     S::Error: 'static,
 # {
 Pipeline::source(source)
+    .id(PipelineId::new("payload-lengths")?)
     .transform(|payload: Vec<u8>| async move {
         Ok::<_, Infallible>(payload.len())
     })
@@ -93,6 +94,38 @@ Checkpoint adapters are available through facade features. `io` enables local fi
 `object-store` adds caller-configured object stores, and `sql-postgres`, `sql-mysql`, and
 `sql-sqlite` add SQLx-backed stores. Adapters encode cursors as JSON, so structured cursor types
 can be used when they implement Serde's `Serialize` and `DeserializeOwned` traits.
+
+## Metrics
+
+Enable the facade's `metrics` feature to emit pipeline metrics through the
+[`metrics`](https://crates.io/crates/metrics) facade. Penstock does not install a recorder; the
+application chooses and configures one (for example, a Prometheus exporter).
+
+```toml
+penstock = { version = "0.1.0", features = ["metrics"] }
+```
+
+Metric names and labels are intentionally bounded:
+
+| Metric | Kind | Labels |
+| --- | --- | --- |
+| `penstock_pipeline_active` | gauge | `pipeline_id`, `topology` |
+| `penstock_records_total` | counter | `pipeline_id`, `topology` |
+| `penstock_batches_total` | counter | `pipeline_id`, `topology` |
+| `penstock_batch_records` | histogram | `pipeline_id`, `topology` |
+| `penstock_sink_deliveries_total` | counter | `pipeline_id`, `topology`, `status` |
+| `penstock_commits_total` | counter | `pipeline_id`, `topology`, `status` |
+| `penstock_errors_total` | counter | `pipeline_id`, `topology`, `stage` |
+| `penstock_stage_duration_seconds` | histogram | `pipeline_id`, `topology`, `stage` |
+
+`topology` is one of `linear`, `fanout_cloned`, or `fanout_shared`. Stage durations cover
+transforms, individual sink deliveries, and cursor commits. Metrics emission is compiled out when
+the feature is disabled, and the optional dependency is omitted. `penstock-core` users can enable
+its feature directly. Construct a stable `PipelineId` once and pass a clone to both `Pipeline::id`
+and `SqlCheckpoint::with_id` to correlate metrics with durable progress. Pipelines without a
+configured identity use the fixed `unnamed` label.
+`PipelineId` permits ASCII letters, digits, `-`, `_`, `.`, `:`, and `/`; this invariant is enforced
+when the value is constructed and does not need to be checked again by checkpoint or metrics code.
 
 Kafka-compatible consumers, including Redpanda, are available from the separate
 `penstock-contrib` crate with its `kafka` feature. Raw and strict Serde JSON modes preserve Kafka

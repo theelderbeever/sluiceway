@@ -15,6 +15,7 @@ version = "0.1.0"
 [workspace.dependencies]
 futures-core = "0.3.33"
 futures-util = { version = "0.3.33", default-features = false, features = ["async-await", "std"] }
+metrics = "0.24.2"
 object_store = "0.14.1"
 penstock-core = { version = "0.1.0", path = "penstock-core" }
 penstock-contrib = { version = "0.1.0", path = "penstock-contrib" }

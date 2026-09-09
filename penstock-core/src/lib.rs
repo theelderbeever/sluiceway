@@ -20,14 +20,17 @@
 
 mod checkpoint;
 mod error;
+mod identity;
 mod pipeline;
 mod record;
 mod sink;
 mod source;
+mod telemetry;
 mod transform;
 
 pub use checkpoint::{CheckpointStore, NoCheckpoint};
 pub use error::{BatchConfigError, DeliveryFailure, ErasedError, PipelineError};
+pub use identity::{PipelineId, PipelineIdError};
 pub use pipeline::{
     BatchPolicy, Batched, FanoutBuilder, FanoutPipeline, LinearPipeline, Pipeline, Unset,
 };

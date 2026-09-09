@@ -6,13 +6,14 @@ version.workspace = true
 
 [features]
 default = []
+metrics = ["penstock-core/metrics"]
 io = ["dep:penstock-io", "penstock-io/filesystem"]
 object-store = ["io", "penstock-io/object-store"]
 sql-postgres = ["io", "penstock-io/sql-postgres"]
 sql-mysql = ["io", "penstock-io/sql-mysql"]
 sql-sqlite = ["io", "penstock-io/sql-sqlite"]
 sql = ["sql-postgres", "sql-mysql", "sql-sqlite"]
-full = ["object-store", "sql"]
+full = ["metrics", "object-store", "sql"]
 
 [dependencies]
 penstock-core.workspace = true
