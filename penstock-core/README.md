@@ -3,52 +3,27 @@
 `penstock-core` is the adapter-independent engine beneath the `penstock` facade. Applications
 should normally import `penstock`; adapter crates may depend directly on this package.
 
-It provides a typed, Tokio-based runner for ordered, branching pipelines:
+It provides two mutually exclusive delivery topologies:
 
 ```text
-Source -> shared transform -> branch transform -> sink --+
-                           `-> branch transform -> sink --+-> commit cursor
+Source -> transform -> LinearPipeline -> sink -> commit cursor
+                    \-> FanoutPipeline --> sink --+
+                                      \-> sink --+-> commit cursor
 ```
 
-Every registered branch runs automatically. For each shared batch, the runner spawns one task per
-branch into an internal `JoinSet`, drains every task, validates every sink's cursor acknowledgment,
-and commits only when all branches succeeded.
+Calling `.sink(sink)` creates a `LinearPipeline`. Its sink consumes an owned
+`Batch<T, C>`, which is an alias for `Vec<Record<T, C>>`.
 
-```rust,no_run
-use std::{convert::Infallible, sync::Arc, time::Duration};
-use penstock_core::{BatchPolicy, Branch, Pipeline};
+Calling `.fanout()` creates a type-state builder that requires `.cloned()` or `.shared()` before
+sinks can be attached. Cloned fanout gives every sink an owned `Batch<T, C>` and therefore requires
+`T: Clone`. Shared fanout gives every sink the same `SharedBatch<T, C>`, an alias for
+`Arc<[Record<T, C>]>`, and requires `T: Sync` instead. Arrays and dynamically assembled vectors of
+type-erased sinks are both accepted.
 
-# async fn run<S, A, B>(source: S, analytics: A, archive: B) -> Result<(), Box<dyn std::error::Error>>
-# where
-#     S: penstock_core::Source<Payload = Vec<u8>>,
-#     A: penstock_core::Sink<usize, Cursor = S::Cursor> + 'static,
-#     B: penstock_core::Sink<Vec<u8>, Cursor = S::Cursor> + 'static,
-#     S::Error: 'static,
-# {
-Pipeline::source(source)
-    .transform(|payload: Vec<u8>| async move {
-        Ok::<_, Infallible>(payload)
-    })
-    .branch(
-        Branch::new("analytics", |payload: Arc<Vec<u8>>| async move {
-            Ok::<_, Infallible>(payload.len())
-        })
-        .sink(analytics),
-    )
-    .branch(
-        Branch::new("archive", |payload: Arc<Vec<u8>>| async move {
-            Ok::<_, Infallible>((*payload).clone())
-        })
-        .sink(archive),
-    )
-    .batched(BatchPolicy::try_new(100, Duration::from_secs(1))?)
-    .run_until(std::future::pending())
-    .await?;
-# Ok(())
-# }
-```
+Every fanout sink task is drained. The source cursor is committed only after every sink succeeds
+and acknowledges the batch's final cursor. No branch names, indexes, transform stages, or task-ID
+metadata are retained.
 
 The cursor is opaque to the runner: it needs equality for acknowledgment validation but does not
 need to be numeric or ordered. Checkpoint persistence remains owned by sources through the generic
-`CheckpointStore<C>` interface, allowing a source to lag or otherwise translate a delivered cursor
-before persisting it.
+`CheckpointStore<C>` interface.

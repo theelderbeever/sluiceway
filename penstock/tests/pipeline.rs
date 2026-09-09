@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     convert::Infallible,
     sync::{
         Arc, Mutex,
@@ -10,8 +11,8 @@ use std::{
 use futures_core::Stream;
 use futures_util::{StreamExt, stream};
 use penstock::{
-    BatchPolicy, Branch, BranchStage, CheckpointStore, Identity, NoCheckpoint, Pipeline,
-    PipelineError, Record, Sink, Source,
+    Batch, BatchPolicy, BoxSink, CheckpointStore, DeliveryFailure, Identity, NoCheckpoint,
+    Pipeline, PipelineError, Record, SharedBatch, Sink, Source,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,41 +59,6 @@ impl Source for Numbers {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("test sink failed")]
-struct SinkFailure;
-
-enum Ack {
-    Exact,
-    Next,
-    Fail,
-}
-
-struct Collected<T> {
-    records: CollectedRecords<T>,
-    ack: Ack,
-}
-
-type CollectedRecords<T> = Arc<Mutex<Vec<Record<T, Cursor>>>>;
-
-impl<T: Send> Sink<T> for Collected<T> {
-    type Cursor = Cursor;
-    type Error = SinkFailure;
-
-    async fn deliver(
-        &self,
-        batch: Vec<Record<T, Self::Cursor>>,
-    ) -> Result<Self::Cursor, Self::Error> {
-        let cursor = batch.last().expect("batches are non-empty").cursor.clone();
-        self.records.lock().unwrap().extend(batch);
-        match self.ack {
-            Ack::Exact => Ok(cursor),
-            Ack::Next => Ok(Cursor::at(cursor.offset + 1)),
-            Ack::Fail => Err(SinkFailure),
-        }
-    }
-}
-
 fn source(values: impl Into<Vec<u64>>) -> (Numbers, Arc<Mutex<Vec<Cursor>>>) {
     let committed = Arc::new(Mutex::new(Vec::new()));
     (
@@ -104,10 +70,39 @@ fn source(values: impl Into<Vec<u64>>) -> (Numbers, Arc<Mutex<Vec<Cursor>>>) {
     )
 }
 
-fn collector<T>(ack: Ack) -> (Collected<T>, CollectedRecords<T>) {
+#[derive(Debug, thiserror::Error)]
+#[error("test sink failed")]
+struct TestSinkError;
+
+#[derive(Clone, Copy)]
+enum Ack {
+    Exact,
+    Next,
+    Fail,
+}
+
+struct LinearCollector<T> {
+    records: LinearRecords<T>,
+    ack: Ack,
+}
+
+type LinearRecords<T> = Arc<Mutex<Vec<Record<T, Cursor>>>>;
+
+impl<T: Send> Sink<Batch<T, Cursor>> for LinearCollector<T> {
+    type Cursor = Cursor;
+    type Error = TestSinkError;
+
+    async fn deliver(&self, batch: Batch<T, Self::Cursor>) -> Result<Self::Cursor, Self::Error> {
+        let cursor = batch.last().expect("batches are non-empty").cursor.clone();
+        self.records.lock().unwrap().extend(batch);
+        acknowledge(self.ack, cursor)
+    }
+}
+
+fn linear_collector<T>(ack: Ack) -> (LinearCollector<T>, LinearRecords<T>) {
     let records = Arc::new(Mutex::new(Vec::new()));
     (
-        Collected {
+        LinearCollector {
             records: Arc::clone(&records),
             ack,
         },
@@ -115,221 +110,442 @@ fn collector<T>(ack: Ack) -> (Collected<T>, CollectedRecords<T>) {
     )
 }
 
+type SharedBatches<T> = Arc<Mutex<Vec<SharedBatch<T, Cursor>>>>;
+
+struct SharedCollector<T> {
+    batches: SharedBatches<T>,
+    ack: Ack,
+}
+
+impl<T: Send + Sync + 'static> Sink<SharedBatch<T, Cursor>> for SharedCollector<T> {
+    type Cursor = Cursor;
+    type Error = TestSinkError;
+
+    async fn deliver(
+        &self,
+        batch: SharedBatch<T, Self::Cursor>,
+    ) -> Result<Self::Cursor, Self::Error> {
+        let cursor = batch.last().expect("batches are non-empty").cursor.clone();
+        self.batches.lock().unwrap().push(batch);
+        acknowledge(self.ack, cursor)
+    }
+}
+
+fn shared_collector<T>(ack: Ack) -> (SharedCollector<T>, SharedBatches<T>) {
+    let batches = Arc::new(Mutex::new(Vec::new()));
+    (
+        SharedCollector {
+            batches: Arc::clone(&batches),
+            ack,
+        },
+        batches,
+    )
+}
+
+fn acknowledge(ack: Ack, cursor: Cursor) -> Result<Cursor, TestSinkError> {
+    match ack {
+        Ack::Exact => Ok(cursor),
+        Ack::Next => Ok(Cursor::at(cursor.offset + 1)),
+        Ack::Fail => Err(TestSinkError),
+    }
+}
+
+struct CountingSink {
+    records: Arc<AtomicUsize>,
+}
+
+impl Sink<SharedBatch<String, Cursor>> for CountingSink {
+    type Cursor = Cursor;
+    type Error = Infallible;
+
+    async fn deliver(
+        &self,
+        batch: SharedBatch<String, Self::Cursor>,
+    ) -> Result<Self::Cursor, Self::Error> {
+        self.records.fetch_add(batch.len(), Ordering::SeqCst);
+        Ok(batch.last().unwrap().cursor.clone())
+    }
+}
+
+struct OwnedCountingSink {
+    records: Arc<AtomicUsize>,
+}
+
+impl Sink<Batch<String, Cursor>> for OwnedCountingSink {
+    type Cursor = Cursor;
+    type Error = Infallible;
+
+    async fn deliver(
+        &self,
+        batch: Batch<String, Self::Cursor>,
+    ) -> Result<Self::Cursor, Self::Error> {
+        self.records.fetch_add(batch.len(), Ordering::SeqCst);
+        Ok(batch.last().unwrap().cursor.clone())
+    }
+}
+
 #[tokio::test]
-async fn registered_typed_branches_run_and_commit_together() {
+async fn linear_pipeline_moves_owned_transformed_batches_to_one_sink() {
     let (source, committed) = source(vec![2, 30, 400]);
-    let shared_calls = Arc::new(AtomicUsize::new(0));
-    let shared = {
-        let calls = Arc::clone(&shared_calls);
-        move |number: u64| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            async move { Ok::<_, Infallible>(number.to_string()) }
-        }
-    };
-    let (lengths, length_records) = collector(Ack::Exact);
-    let (uppercase, uppercase_records) = collector(Ack::Exact);
-    let (identity, identity_records) = collector(Ack::Exact);
+    let (sink, records) = linear_collector(Ack::Exact);
 
     Pipeline::source(source)
-        .transform(shared)
-        .branch(
-            Branch::new("lengths", |value: Arc<String>| async move {
-                Ok::<_, Infallible>(value.len())
-            })
-            .sink(lengths),
-        )
-        .branch(
-            Branch::new("uppercase", |value: Arc<String>| async move {
-                Ok::<_, Infallible>(value.to_uppercase())
-            })
-            .sink(uppercase),
-        )
-        .branch(Branch::identity("identity").sink(identity))
+        .transform(|number: u64| async move { Ok::<_, Infallible>(number.to_string()) })
+        .sink(sink)
         .batched(BatchPolicy::try_new(2, Duration::from_secs(1)).unwrap())
         .run_until(std::future::pending())
         .await
         .unwrap();
 
-    assert_eq!(shared_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        records
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|record| record.payload.as_str())
+            .collect::<Vec<_>>(),
+        vec!["2", "30", "400"]
+    );
     assert_eq!(
         *committed.lock().unwrap(),
         vec![Cursor::at(1), Cursor::at(2)]
     );
+}
+
+#[tokio::test]
+async fn cloned_fanout_reuses_owned_sinks() {
+    let (source, committed) = source(vec![2, 30, 400]);
+    let (collector, records) = linear_collector(Ack::Exact);
+    let count = Arc::new(AtomicUsize::new(0));
+    let counter = OwnedCountingSink {
+        records: Arc::clone(&count),
+    };
+
+    Pipeline::source(source)
+        .transform(|number: u64| async move { Ok::<_, Infallible>(number.to_string()) })
+        .fanout()
+        .cloned()
+        .sinks([collector.into(), counter.into()])
+        .batched(BatchPolicy::try_new(2, Duration::from_secs(1)).unwrap())
+        .run_until(std::future::pending())
+        .await
+        .unwrap();
+
+    assert_eq!(records.lock().unwrap().len(), 3);
+    assert_eq!(count.load(Ordering::SeqCst), 3);
     assert_eq!(
-        length_records
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|record| record.payload)
-            .collect::<Vec<_>>(),
-        vec![1, 2, 3]
-    );
-    assert_eq!(
-        uppercase_records
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|record| record.payload.as_str())
-            .collect::<Vec<_>>(),
-        vec!["2", "30", "400"]
-    );
-    assert_eq!(
-        identity_records
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|record| record.payload.as_str())
-            .collect::<Vec<_>>(),
-        vec!["2", "30", "400"]
+        *committed.lock().unwrap(),
+        vec![Cursor::at(1), Cursor::at(2)]
     );
 }
 
 #[tokio::test]
-async fn join_set_runs_all_registered_branches_concurrently() {
+async fn cloned_fanout_does_not_require_sync_payloads() {
+    let (source, _) = source(vec![7]);
+    let (first, first_records) = linear_collector(Ack::Exact);
+    let (second, second_records) = linear_collector(Ack::Exact);
+
+    Pipeline::source(source)
+        .transform(|number| async move { Ok::<_, Infallible>(Cell::new(number)) })
+        .fanout()
+        .cloned()
+        .sinks([first.into(), second.into()])
+        .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
+        .run_until(std::future::pending())
+        .await
+        .unwrap();
+
+    assert_eq!(first_records.lock().unwrap()[0].payload.get(), 7);
+    assert_eq!(second_records.lock().unwrap()[0].payload.get(), 7);
+}
+
+struct NonClone(u64);
+
+#[tokio::test]
+async fn shared_fanout_does_not_require_clone_payloads() {
+    let (source, _) = source(vec![7]);
+    let (first, first_batches) = shared_collector(Ack::Exact);
+    let (second, second_batches) = shared_collector(Ack::Exact);
+
+    Pipeline::source(source)
+        .transform(|number| async move { Ok::<_, Infallible>(NonClone(number)) })
+        .fanout()
+        .shared()
+        .sinks([first.into(), second.into()])
+        .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
+        .run_until(std::future::pending())
+        .await
+        .unwrap();
+
+    assert_eq!(first_batches.lock().unwrap()[0][0].payload.0, 7);
+    assert_eq!(second_batches.lock().unwrap()[0][0].payload.0, 7);
+}
+
+#[tokio::test]
+async fn fanout_accepts_heterogeneous_array_and_shares_whole_batches() {
+    let (source, committed) = source(vec![2, 30, 400]);
+    let transform_calls = Arc::new(AtomicUsize::new(0));
+    let transform = {
+        let calls = Arc::clone(&transform_calls);
+        move |number: u64| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok::<_, Infallible>(number.to_string()) }
+        }
+    };
+    let (first, first_batches) = shared_collector(Ack::Exact);
+    let (second, second_batches) = shared_collector(Ack::Exact);
+    let count = Arc::new(AtomicUsize::new(0));
+    let counter = CountingSink {
+        records: Arc::clone(&count),
+    };
+
+    Pipeline::source(source)
+        .transform(transform)
+        .fanout()
+        .shared()
+        .sinks([first.into(), second.into(), counter.into()])
+        .batched(BatchPolicy::try_new(2, Duration::from_secs(1)).unwrap())
+        .run_until(std::future::pending())
+        .await
+        .unwrap();
+
+    assert_eq!(transform_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        *committed.lock().unwrap(),
+        vec![Cursor::at(1), Cursor::at(2)]
+    );
+    let first = first_batches.lock().unwrap();
+    let second = second_batches.lock().unwrap();
+    assert_eq!(first.len(), 2);
+    assert_eq!(second.len(), 2);
+    assert!(Arc::ptr_eq(&first[0], &second[0]));
+    assert!(Arc::ptr_eq(&first[1], &second[1]));
+}
+
+#[tokio::test]
+async fn fanout_accepts_a_dynamically_built_sink_vec() {
+    let (source, committed) = source(vec![7]);
+    let (first, first_batches) = shared_collector(Ack::Exact);
+    let (second, second_batches) = shared_collector(Ack::Exact);
+    let mut sinks: Vec<BoxSink<u64, Cursor>> = vec![first.into()];
+    sinks.push(second.into());
+
+    Pipeline::source(source)
+        .transform(Identity)
+        .fanout()
+        .shared()
+        .sinks(sinks)
+        .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
+        .run_until(std::future::pending())
+        .await
+        .unwrap();
+
+    assert_eq!(*committed.lock().unwrap(), vec![Cursor::at(0)]);
+    assert!(Arc::ptr_eq(
+        &first_batches.lock().unwrap()[0],
+        &second_batches.lock().unwrap()[0]
+    ));
+}
+
+struct StartedSource {
+    started: Arc<AtomicBool>,
+}
+
+impl Source for StartedSource {
+    type Payload = u64;
+    type Cursor = Cursor;
+    type Error = Infallible;
+
+    fn stream(
+        &self,
+    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Cursor>, Self::Error>> + Send + '_
+    {
+        self.started.store(true, Ordering::SeqCst);
+        stream::empty()
+    }
+
+    async fn commit(&self, _cursor: Self::Cursor) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn empty_fanout_fails_before_starting_the_source() {
+    let started = Arc::new(AtomicBool::new(false));
+    let source = StartedSource {
+        started: Arc::clone(&started),
+    };
+    let sinks: Vec<BoxSink<u64, Cursor>> = Vec::new();
+
+    let result = Pipeline::source(source)
+        .transform(Identity)
+        .fanout()
+        .shared()
+        .sinks(sinks)
+        .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
+        .run_until(std::future::pending())
+        .await;
+
+    assert!(matches!(result, Err(PipelineError::NoSinks)));
+    assert!(!started.load(Ordering::SeqCst));
+}
+
+enum ProbeBehavior {
+    Exact,
+    Fail,
+    Slow(Arc<AtomicBool>),
+    Barrier(Arc<tokio::sync::Barrier>),
+    Panic,
+}
+
+struct ProbeSink {
+    behavior: ProbeBehavior,
+}
+
+impl Sink<SharedBatch<u64, Cursor>> for ProbeSink {
+    type Cursor = Cursor;
+    type Error = TestSinkError;
+
+    async fn deliver(
+        &self,
+        batch: SharedBatch<u64, Self::Cursor>,
+    ) -> Result<Self::Cursor, Self::Error> {
+        let cursor = batch.last().unwrap().cursor.clone();
+        match &self.behavior {
+            ProbeBehavior::Exact => Ok(cursor),
+            ProbeBehavior::Fail => Err(TestSinkError),
+            ProbeBehavior::Slow(completed) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                completed.store(true, Ordering::SeqCst);
+                Ok(cursor)
+            }
+            ProbeBehavior::Barrier(barrier) => {
+                barrier.wait().await;
+                Ok(cursor)
+            }
+            ProbeBehavior::Panic => panic!("sink panic"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn fanout_sinks_run_concurrently() {
     let (source, committed) = source(vec![7]);
     let barrier = Arc::new(tokio::sync::Barrier::new(3));
-    let (one, _) = collector(Ack::Exact);
-    let (two, _) = collector(Ack::Exact);
-    let (three, _) = collector(Ack::Exact);
-
-    let branch = |name, sink| {
-        let barrier = Arc::clone(&barrier);
-        Branch::new(name, move |value: Arc<u64>| {
-            let barrier = Arc::clone(&barrier);
-            async move {
-                barrier.wait().await;
-                Ok::<_, Infallible>(*value)
-            }
-        })
-        .sink(sink)
+    let sink = || ProbeSink {
+        behavior: ProbeBehavior::Barrier(Arc::clone(&barrier)),
     };
 
     tokio::time::timeout(
         Duration::from_secs(1),
         Pipeline::source(source)
             .transform(Identity)
-            .branch(branch("one", one))
-            .branch(branch("two", two))
-            .branch(branch("three", three))
+            .fanout()
+            .shared()
+            .sinks([sink().into(), sink().into(), sink().into()])
             .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
             .run_until(std::future::pending()),
     )
     .await
-    .expect("all branch transforms should reach the barrier")
+    .expect("all sinks should reach the barrier")
     .unwrap();
 
     assert_eq!(*committed.lock().unwrap(), vec![Cursor::at(0)]);
 }
 
 #[tokio::test]
-async fn cursor_mismatch_prevents_commit() {
+async fn fanout_drains_started_sinks_and_reports_failures_without_metadata() {
     let (source, committed) = source(vec![1]);
-    let (sink, _) = collector(Ack::Next);
+    let completed = Arc::new(AtomicBool::new(false));
+    let slow = ProbeSink {
+        behavior: ProbeBehavior::Slow(Arc::clone(&completed)),
+    };
+    let failed = ProbeSink {
+        behavior: ProbeBehavior::Fail,
+    };
 
     let result = Pipeline::source(source)
         .transform(Identity)
-        .branch(Branch::identity("wrong-cursor").sink(sink))
+        .fanout()
+        .shared()
+        .sinks([slow.into(), failed.into()])
         .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
         .run_until(std::future::pending())
         .await;
 
     let failures = match result {
-        Err(PipelineError::Branches(failures)) => failures,
-        other => panic!("expected branch failure, got {other:?}"),
+        Err(PipelineError::Sinks(failures)) => failures,
+        other => panic!("expected sink failures, got {other:?}"),
     };
     assert_eq!(failures.len(), 1);
-    assert_eq!(failures[0].stage, BranchStage::Cursor);
-    assert_eq!(failures[0].name, "wrong-cursor");
-    assert!(committed.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn sink_failure_drains_other_started_branches_before_returning() {
-    let (source, committed) = source(vec![1]);
-    let completed = Arc::new(AtomicBool::new(false));
-    let (slow, _) = collector(Ack::Exact);
-    let (failed, _) = collector(Ack::Fail);
-    let slow_transform = {
-        let completed = Arc::clone(&completed);
-        move |value: Arc<u64>| {
-            let completed = Arc::clone(&completed);
-            async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                completed.store(true, Ordering::SeqCst);
-                Ok::<_, Infallible>(*value)
-            }
-        }
-    };
-
-    let result = Pipeline::source(source)
-        .transform(Identity)
-        .branch(Branch::new("slow", slow_transform).sink(slow))
-        .branch(Branch::identity("failed").sink(failed))
-        .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
-        .run_until(std::future::pending())
-        .await;
-
-    assert!(matches!(result, Err(PipelineError::Branches(_))));
+    assert!(matches!(failures[0], DeliveryFailure::Sink(_)));
     assert!(completed.load(Ordering::SeqCst));
     assert!(committed.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn all_branch_failures_are_reported_in_registration_order() {
+async fn fanout_sink_panics_are_reported_and_prevent_commit() {
     let (source, committed) = source(vec![1]);
-    let (first, _) = collector::<Arc<u64>>(Ack::Fail);
-    let (second, _) = collector::<Arc<u64>>(Ack::Fail);
+    let panics = ProbeSink {
+        behavior: ProbeBehavior::Panic,
+    };
+    let succeeds = ProbeSink {
+        behavior: ProbeBehavior::Exact,
+    };
 
     let result = Pipeline::source(source)
         .transform(Identity)
-        .branch(Branch::identity("first").sink(first))
-        .branch(Branch::identity("second").sink(second))
+        .fanout()
+        .shared()
+        .sinks([panics.into(), succeeds.into()])
         .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
         .run_until(std::future::pending())
         .await;
 
     let failures = match result {
-        Err(PipelineError::Branches(failures)) => failures,
-        other => panic!("expected branch failures, got {other:?}"),
+        Err(PipelineError::Sinks(failures)) => failures,
+        other => panic!("expected sink task failure, got {other:?}"),
     };
-    assert_eq!(
-        failures
-            .iter()
-            .map(|failure| failure.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["first", "second"]
-    );
-    assert!(
-        failures
-            .iter()
-            .all(|failure| failure.stage == BranchStage::Sink)
-    );
+    assert!(matches!(failures[0], DeliveryFailure::Task(_)));
     assert!(committed.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn branch_task_panics_are_reported_and_prevent_commit() {
+async fn cursor_mismatch_prevents_commit() {
     let (source, committed) = source(vec![1]);
-    let (sink, _) = collector::<u64>(Ack::Exact);
-    let panic_transform = |_: Arc<u64>| async move {
-        panic!("branch panic");
-        #[allow(unreachable_code)]
-        Ok::<_, Infallible>(0)
-    };
+    let (sink, _) = linear_collector(Ack::Next);
 
     let result = Pipeline::source(source)
         .transform(Identity)
-        .branch(Branch::new("panics", panic_transform).sink(sink))
+        .sink(sink)
         .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
         .run_until(std::future::pending())
         .await;
 
-    let failures = match result {
-        Err(PipelineError::Branches(failures)) => failures,
-        other => panic!("expected task failure, got {other:?}"),
-    };
-    assert_eq!(failures[0].stage, BranchStage::Task);
-    assert_eq!(failures[0].name, "panics");
+    assert!(matches!(
+        result,
+        Err(PipelineError::Sink(DeliveryFailure::Cursor { .. }))
+    ));
+    assert!(committed.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn sink_failure_prevents_commit() {
+    let (source, committed) = source(vec![1]);
+    let (sink, _) = linear_collector(Ack::Fail);
+
+    let result = Pipeline::source(source)
+        .transform(Identity)
+        .sink(sink)
+        .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
+        .run_until(std::future::pending())
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(PipelineError::Sink(DeliveryFailure::Sink(_)))
+    ));
     assert!(committed.lock().unwrap().is_empty());
 }
 
@@ -395,31 +611,31 @@ impl Source for FallibleSource {
 struct TransformFailure;
 
 #[tokio::test]
-async fn source_shared_transform_and_commit_errors_retain_their_stage() {
-    let (sink, _) = collector::<Arc<u64>>(Ack::Exact);
+async fn source_transform_and_commit_errors_retain_their_stage() {
+    let (sink, _) = linear_collector::<u64>(Ack::Exact);
     let failing_source = FallibleSource {
         fail_stream: true,
         committed: Arc::new(AtomicBool::new(false)),
     };
     let source_result = Pipeline::source(failing_source)
         .transform(Identity)
-        .branch(Branch::identity("sink").sink(sink))
+        .sink(sink)
         .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
         .run_until(std::future::pending())
         .await;
     assert!(matches!(source_result, Err(PipelineError::Source(_))));
 
     let (source, _) = source(vec![1]);
-    let (sink, _) = collector::<Arc<u64>>(Ack::Exact);
+    let (sink, _) = linear_collector::<u64>(Ack::Exact);
     let transform_result = Pipeline::source(source)
         .transform(|_: u64| async move { Err::<u64, _>(TransformFailure) })
-        .branch(Branch::identity("sink").sink(sink))
+        .sink(sink)
         .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
         .run_until(std::future::pending())
         .await;
     assert!(matches!(
         transform_result,
-        Err(PipelineError::SharedTransform(TransformFailure))
+        Err(PipelineError::Transform(TransformFailure))
     ));
 
     let committed = Arc::new(AtomicBool::new(false));
@@ -427,41 +643,15 @@ async fn source_shared_transform_and_commit_errors_retain_their_stage() {
         fail_stream: false,
         committed: Arc::clone(&committed),
     };
-    let (sink, _) = collector::<Arc<u64>>(Ack::Exact);
+    let (sink, _) = linear_collector::<u64>(Ack::Exact);
     let commit_result = Pipeline::source(source)
         .transform(Identity)
-        .branch(Branch::identity("sink").sink(sink))
+        .sink(sink)
         .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
         .run_until(std::future::pending())
         .await;
     assert!(matches!(commit_result, Err(PipelineError::Commit(_))));
     assert!(committed.load(Ordering::SeqCst));
-}
-
-#[tokio::test]
-async fn branch_transform_failure_prevents_delivery_and_commit() {
-    let (source, committed) = source(vec![1]);
-    let (sink, records) = collector::<u64>(Ack::Exact);
-
-    let result = Pipeline::source(source)
-        .transform(Identity)
-        .branch(
-            Branch::new("transform", |_: Arc<u64>| async move {
-                Err::<u64, _>(TransformFailure)
-            })
-            .sink(sink),
-        )
-        .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
-        .run_until(std::future::pending())
-        .await;
-
-    let failures = match result {
-        Err(PipelineError::Branches(failures)) => failures,
-        other => panic!("expected branch transform failure, got {other:?}"),
-    };
-    assert_eq!(failures[0].stage, BranchStage::Transform);
-    assert!(records.lock().unwrap().is_empty());
-    assert!(committed.lock().unwrap().is_empty());
 }
 
 struct DelayedSource {
@@ -497,11 +687,11 @@ async fn timeout_and_end_of_stream_flush_partial_batches() {
     let source = DelayedSource {
         committed: Arc::clone(&committed),
     };
-    let (sink, _) = collector::<Arc<u64>>(Ack::Exact);
+    let (sink, _) = linear_collector(Ack::Exact);
 
     Pipeline::source(source)
         .transform(Identity)
-        .branch(Branch::identity("sink").sink(sink))
+        .sink(sink)
         .batched(BatchPolicy::try_new(10, Duration::from_millis(10)).unwrap())
         .run_until(std::future::pending())
         .await
@@ -543,7 +733,7 @@ async fn shutdown_drains_admitted_transform_and_flushes_its_batch() {
     };
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
-    let shared = {
+    let transform = {
         let shutdown_tx = Arc::clone(&shutdown_tx);
         move |value: u64| {
             shutdown_tx
@@ -556,11 +746,11 @@ async fn shutdown_drains_admitted_transform_and_flushes_its_batch() {
             async move { Ok::<_, Infallible>(value) }
         }
     };
-    let (sink, records) = collector::<Arc<u64>>(Ack::Exact);
+    let (sink, records) = linear_collector(Ack::Exact);
 
     Pipeline::source(source)
-        .transform(shared)
-        .branch(Branch::identity("sink").sink(sink))
+        .transform(transform)
+        .sink(sink)
         .batched(BatchPolicy::try_new(10, Duration::from_secs(1)).unwrap())
         .run_until(async {
             let _ = shutdown_rx.await;
@@ -601,17 +791,17 @@ impl Source for PositionedSource {
 }
 
 #[tokio::test]
-async fn repeated_and_non_monotonic_cursors_are_opaque_to_the_pipeline() {
+async fn repeated_and_non_monotonic_cursors_remain_opaque() {
     let committed = Arc::new(Mutex::new(Vec::new()));
     let source = PositionedSource {
         cursors: vec![Cursor::at(4), Cursor::at(4), Cursor::at(2)],
         committed: Arc::clone(&committed),
     };
-    let (sink, _) = collector::<Arc<()>>(Ack::Exact);
+    let (sink, _) = linear_collector(Ack::Exact);
 
     Pipeline::source(source)
         .transform(Identity)
-        .branch(Branch::identity("sink").sink(sink))
+        .sink(sink)
         .batched(BatchPolicy::try_new(2, Duration::from_secs(1)).unwrap())
         .run_until(std::future::pending())
         .await

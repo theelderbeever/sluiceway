@@ -1,6 +1,6 @@
 [package]
 name = "penstock-core"
-description = "Core traits and runner for the Penstock branching pipeline framework"
+description = "Core traits and runners for Penstock linear and fanout pipelines"
 edition.workspace = true
 version.workspace = true
 

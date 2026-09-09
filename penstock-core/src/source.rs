@@ -4,7 +4,7 @@ use futures_core::Stream;
 
 use crate::Record;
 
-/// Produces ordered records and commits positions that have been delivered by every branch.
+/// Produces ordered records and commits positions that have been delivered by every sink.
 pub trait Source: Send + Sync {
     type Payload: Send;
     type Cursor: Clone + Eq + Debug + Send + Sync + 'static;

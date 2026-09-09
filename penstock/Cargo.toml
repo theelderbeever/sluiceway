@@ -1,6 +1,6 @@
 [package]
 name = "penstock"
-description = "Facade for the Penstock typed branching pipeline framework"
+description = "Facade for the Penstock typed linear and fanout pipeline framework"
 edition.workspace = true
 version.workspace = true
 

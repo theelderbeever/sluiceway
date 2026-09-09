@@ -1,10 +1,10 @@
-//! A typed, ordered, branching pipeline runner.
+//! Typed, ordered linear and fanout pipeline runners.
 //!
-//! One shared transform runs before any number of registered branches. Each branch has its own
-//! transform and sink. A batch is committed only after every branch acknowledges its final
-//! cursor, providing at-least-once delivery.
+//! One consuming transform feeds either a single owned sink or a type-erased fanout of sinks. A
+//! batch is committed only after every sink acknowledges its final cursor, providing at-least-once
+//! delivery.
 //!
-//! Pipelines cannot run until at least one branch and a batch policy are configured:
+//! Pipelines cannot run until a delivery topology and batch policy are configured:
 //!
 //! ```compile_fail
 //! # use penstock_core::{Identity, Pipeline};
@@ -18,7 +18,6 @@
 //! # }
 //! ```
 
-mod branch;
 mod checkpoint;
 mod error;
 mod pipeline;
@@ -27,13 +26,12 @@ mod sink;
 mod source;
 mod transform;
 
-pub use branch::{Branch, BranchUnset, Cons, Nil};
-#[doc(hidden)]
-pub use branch::{BranchMeta, ExecuteBranch, SpawnBranches};
 pub use checkpoint::{CheckpointStore, NoCheckpoint};
-pub use error::{BatchConfigError, BranchFailure, BranchStage, PipelineError};
-pub use pipeline::{BatchPolicy, Batched, Pipeline, Unset};
+pub use error::{BatchConfigError, DeliveryFailure, ErasedError, PipelineError};
+pub use pipeline::{
+    BatchPolicy, Batched, FanoutBuilder, FanoutPipeline, LinearPipeline, Pipeline, Unset,
+};
 pub use record::Record;
-pub use sink::Sink;
+pub use sink::{Batch, BoxSink, Cloned, FanoutMode, Shared, SharedBatch, Sink};
 pub use source::Source;
 pub use transform::{Identity, Transform, Transformer};

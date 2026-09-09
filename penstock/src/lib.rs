@@ -1,4 +1,4 @@
-//! Public facade for the Penstock typed branching pipeline framework.
+//! Public facade for the Penstock typed linear and fanout pipeline framework.
 //!
 //! Core types are re-exported at the crate root so applications normally need only `penstock`.
 //! Enable `io`, `object-store`, or one of the `sql-*` features for durable checkpoint adapters.

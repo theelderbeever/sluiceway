@@ -1,13 +1,13 @@
 use std::{
-    collections::HashMap, fmt::Debug, future::Future, num::NonZeroUsize, sync::Arc, time::Duration,
+    fmt::Debug, future::Future, marker::PhantomData, num::NonZeroUsize, sync::Arc, time::Duration,
 };
 
 use futures_util::StreamExt;
 use tokio::task::JoinSet;
 
 use crate::{
-    BatchConfigError, Branch, BranchFailure, BranchStage, Cons, ExecuteBranch, Nil, PipelineError,
-    Record, Source, SpawnBranches, Transform, branch::SharedBatch,
+    Batch, BatchConfigError, BoxSink, Cloned, DeliveryFailure, ErasedError, FanoutMode,
+    PipelineError, Record, Shared, SharedBatch, Sink, Source, Transform,
 };
 
 /// Type-state marker for a pipeline stage that has not been configured.
@@ -48,108 +48,173 @@ impl BatchPolicy {
     }
 }
 
-/// Type-state builder and runner for a source, one shared transform, and typed branches.
-pub struct Pipeline<So, Sh = Unset, Bs = Nil, St = Unset> {
+/// A source and its consuming transform, before delivery topology is selected.
+pub struct Pipeline<So, Tr = Unset> {
     source: So,
-    shared: Sh,
-    branches: Bs,
-    strategy: St,
-    branch_count: usize,
+    transform: Tr,
 }
 
 impl<So: Source> Pipeline<So> {
     pub fn source(source: So) -> Self {
         Self {
             source,
-            shared: Unset,
-            branches: Nil,
-            strategy: Unset,
-            branch_count: 0,
+            transform: Unset,
         }
     }
 
-    pub fn transform<Sh>(self, shared: Sh) -> Pipeline<So, Sh>
+    pub fn transform<Tr>(self, transform: Tr) -> Pipeline<So, Tr>
     where
-        Sh: Transform<So::Payload>,
+        Tr: Transform<So::Payload>,
     {
         Pipeline {
             source: self.source,
-            shared,
-            branches: self.branches,
-            strategy: self.strategy,
-            branch_count: self.branch_count,
+            transform,
         }
     }
 }
 
-impl<So, Sh, Bs> Pipeline<So, Sh, Bs>
+impl<So, Tr> Pipeline<So, Tr>
 where
     So: Source,
-    Sh: Transform<So::Payload>,
+    Tr: Transform<So::Payload>,
 {
-    pub fn branch<T, S>(
-        self,
-        mut branch: Branch<T, S>,
-    ) -> Pipeline<So, Sh, Cons<Branch<T, S>, Bs>> {
-        branch.index = self.branch_count;
-        Pipeline {
+    /// Select linear delivery. Transformed values remain owned and are consumed by one sink.
+    pub fn sink<Si>(self, sink: Si) -> LinearPipeline<So, Tr, Si> {
+        LinearPipeline {
             source: self.source,
-            shared: self.shared,
-            branches: Cons {
-                head: Arc::new(branch),
-                tail: self.branches,
-            },
-            strategy: self.strategy,
-            branch_count: self.branch_count + 1,
+            transform: self.transform,
+            sink,
+            strategy: Unset,
+        }
+    }
+
+    /// Begin configuring a fanout delivery topology.
+    pub fn fanout(self) -> FanoutBuilder<So, Tr> {
+        FanoutBuilder {
+            source: self.source,
+            transform: self.transform,
+            mode: PhantomData,
         }
     }
 }
 
-impl<So, Sh, H, T> Pipeline<So, Sh, Cons<H, T>>
+/// A fanout builder requiring an ownership mode before sinks can be attached.
+pub struct FanoutBuilder<So, Tr, Mode = Unset> {
+    source: So,
+    transform: Tr,
+    mode: PhantomData<Mode>,
+}
+
+impl<So, Tr> FanoutBuilder<So, Tr>
 where
     So: Source,
-    Sh: Transform<So::Payload>,
+    Tr: Transform<So::Payload>,
 {
-    pub fn batched(self, policy: BatchPolicy) -> Pipeline<So, Sh, Cons<H, T>, Batched> {
-        Pipeline {
+    /// Give every sink its own owned clone of each batch.
+    pub fn cloned(self) -> FanoutBuilder<So, Tr, Cloned> {
+        FanoutBuilder {
             source: self.source,
-            shared: self.shared,
-            branches: self.branches,
+            transform: self.transform,
+            mode: PhantomData,
+        }
+    }
+
+    /// Give every sink the same immutable, reference-counted batch.
+    pub fn shared(self) -> FanoutBuilder<So, Tr, Shared> {
+        FanoutBuilder {
+            source: self.source,
+            transform: self.transform,
+            mode: PhantomData,
+        }
+    }
+}
+
+impl<So, Tr> FanoutBuilder<So, Tr, Cloned>
+where
+    So: Source,
+    Tr: Transform<So::Payload>,
+    Tr::Out: Send + 'static,
+{
+    pub fn sinks<I>(self, sinks: I) -> FanoutPipeline<So, Tr, Cloned>
+    where
+        I: IntoIterator<Item = BoxSink<Tr::Out, So::Cursor, Cloned>>,
+    {
+        FanoutPipeline {
+            source: self.source,
+            transform: self.transform,
+            sinks: sinks.into_iter().collect(),
+            strategy: Unset,
+        }
+    }
+}
+
+impl<So, Tr> FanoutBuilder<So, Tr, Shared>
+where
+    So: Source,
+    Tr: Transform<So::Payload>,
+    Tr::Out: Send + Sync + 'static,
+{
+    pub fn sinks<I>(self, sinks: I) -> FanoutPipeline<So, Tr, Shared>
+    where
+        I: IntoIterator<Item = BoxSink<Tr::Out, So::Cursor, Shared>>,
+    {
+        FanoutPipeline {
+            source: self.source,
+            transform: self.transform,
+            sinks: sinks.into_iter().collect(),
+            strategy: Unset,
+        }
+    }
+}
+
+/// A pipeline that moves each transformed batch into one sink.
+pub struct LinearPipeline<So, Tr, Si, St = Unset> {
+    source: So,
+    transform: Tr,
+    sink: Si,
+    strategy: St,
+}
+
+impl<So, Tr, Si> LinearPipeline<So, Tr, Si>
+where
+    So: Source,
+    Tr: Transform<So::Payload>,
+{
+    pub fn batched(self, policy: BatchPolicy) -> LinearPipeline<So, Tr, Si, Batched> {
+        LinearPipeline {
+            source: self.source,
+            transform: self.transform,
+            sink: self.sink,
             strategy: Batched { policy },
-            branch_count: self.branch_count,
         }
     }
 }
 
-impl<So, Sh, H, Tail> Pipeline<So, Sh, Cons<H, Tail>, Batched>
+impl<So, Tr, Si> LinearPipeline<So, Tr, Si, Batched>
 where
     So: Source,
     So::Cursor: Clone + Eq + Debug + Send + Sync + 'static,
-    Sh: Transform<So::Payload>,
-    Sh::Out: Send + Sync + 'static,
-    H: ExecuteBranch<Sh::Out, So::Cursor> + 'static,
-    Tail: SpawnBranches<Sh::Out, So::Cursor>,
+    Tr: Transform<So::Payload>,
+    Si: Sink<Batch<Tr::Out, So::Cursor>, Cursor = So::Cursor>,
 {
     pub async fn run_until(
         self,
         shutdown: impl Future<Output = ()> + Send,
-    ) -> Result<(), PipelineError<So::Error, Sh::Error>> {
-        let shared = &self.shared;
-        // Stop accepting source records on shutdown, then drain transforms already admitted by
-        // the ordered buffer and flush its final partial batch.
+    ) -> Result<(), PipelineError<So::Error, Tr::Error, Si::Error>> {
+        let transform = &self.transform;
         let records = self
             .source
             .stream()
             .take_until(shutdown)
             .map(|item| async move {
                 let Record { cursor, payload } = item.map_err(PipelineError::Source)?;
-                let payload = shared
+                let payload = transform
                     .apply(payload)
                     .await
-                    .map_err(PipelineError::SharedTransform)?;
-                Ok(Record::new(cursor, Arc::new(payload)))
+                    .map_err(PipelineError::Transform)?;
+                Ok(Record::new(cursor, payload))
             })
-            .buffered(shared.max_concurrency().get());
+            .buffered(transform.max_concurrency().get());
         tokio::pin!(records);
         let chunks = tokio_stream::StreamExt::chunks_timeout(
             records,
@@ -159,57 +224,21 @@ where
         tokio::pin!(chunks);
 
         while let Some(chunk) = chunks.next().await {
-            let records: Vec<Record<Arc<Sh::Out>, So::Cursor>> =
+            let records: Batch<Tr::Out, So::Cursor> =
                 chunk.into_iter().collect::<Result<_, _>>()?;
             let Some(expected) = records.last().map(|record| record.cursor.clone()) else {
                 continue;
             };
-            let batch: SharedBatch<Sh::Out, So::Cursor> = records.into();
-            let mut tasks = JoinSet::new();
-            let mut metadata = HashMap::with_capacity(self.branch_count);
-            self.branches.spawn_all(batch, &mut tasks, &mut metadata);
 
-            let mut failures = Vec::new();
-            while let Some(joined) = tasks.join_next_with_id().await {
-                match joined {
-                    Ok((id, Ok(actual))) => {
-                        let branch = metadata
-                            .remove(&id)
-                            .expect("every spawned branch task has metadata");
-                        if actual != expected {
-                            failures.push(BranchFailure::cursor(
-                                branch.name,
-                                branch.index,
-                                &expected,
-                                actual,
-                            ));
-                        }
-                    }
-                    Ok((id, Err(failure))) => {
-                        metadata.remove(&id);
-                        failures.push(failure);
-                    }
-                    Err(error) => {
-                        let branch =
-                            metadata
-                                .remove(&error.id())
-                                .unwrap_or_else(|| crate::BranchMeta {
-                                    name: "unknown".to_owned(),
-                                    index: usize::MAX,
-                                });
-                        failures.push(BranchFailure::stage(
-                            branch.name,
-                            branch.index,
-                            BranchStage::Task,
-                            error,
-                        ));
-                    }
-                }
-            }
-
-            if !failures.is_empty() {
-                failures.sort_by_key(|failure| failure.index);
-                return Err(PipelineError::Branches(failures));
+            let actual = self
+                .sink
+                .deliver(records)
+                .await
+                .map_err(|error| PipelineError::Sink(DeliveryFailure::Sink(error)))?;
+            if actual != expected {
+                return Err(PipelineError::Sink(DeliveryFailure::cursor(
+                    &expected, actual,
+                )));
             }
 
             self.source
@@ -219,4 +248,192 @@ where
         }
         Ok(())
     }
+}
+
+/// A fanout pipeline whose erased sink input determines cloned or shared delivery.
+pub struct FanoutPipeline<So, Tr, Mode, St = Unset>
+where
+    So: Source,
+    Tr: Transform<So::Payload>,
+    Mode: FanoutMode<Tr::Out, So::Cursor>,
+{
+    source: So,
+    transform: Tr,
+    sinks: Vec<BoxSink<Tr::Out, So::Cursor, Mode>>,
+    strategy: St,
+}
+
+impl<So, Tr, Mode> FanoutPipeline<So, Tr, Mode>
+where
+    So: Source,
+    Tr: Transform<So::Payload>,
+    Mode: FanoutMode<Tr::Out, So::Cursor>,
+{
+    pub fn batched(self, policy: BatchPolicy) -> FanoutPipeline<So, Tr, Mode, Batched> {
+        FanoutPipeline {
+            source: self.source,
+            transform: self.transform,
+            sinks: self.sinks,
+            strategy: Batched { policy },
+        }
+    }
+}
+
+impl<So, Tr> FanoutPipeline<So, Tr, Cloned, Batched>
+where
+    So: Source,
+    So::Cursor: Clone + Eq + Debug + Send + Sync + 'static,
+    Tr: Transform<So::Payload>,
+    Tr::Out: Clone + Send + 'static,
+{
+    pub async fn run_until(
+        self,
+        shutdown: impl Future<Output = ()> + Send,
+    ) -> Result<(), PipelineError<So::Error, Tr::Error, ErasedError>> {
+        if self.sinks.is_empty() {
+            return Err(PipelineError::NoSinks);
+        }
+
+        let transform = &self.transform;
+        let records = self
+            .source
+            .stream()
+            .take_until(shutdown)
+            .map(|item| async move {
+                let Record { cursor, payload } = item.map_err(PipelineError::Source)?;
+                let payload = transform
+                    .apply(payload)
+                    .await
+                    .map_err(PipelineError::Transform)?;
+                Ok(Record::new(cursor, payload))
+            })
+            .buffered(transform.max_concurrency().get());
+        tokio::pin!(records);
+        let chunks = tokio_stream::StreamExt::chunks_timeout(
+            records,
+            self.strategy.policy.size.get(),
+            self.strategy.policy.timeout,
+        );
+        tokio::pin!(chunks);
+
+        while let Some(chunk) = chunks.next().await {
+            let records: Batch<Tr::Out, So::Cursor> =
+                chunk.into_iter().collect::<Result<_, _>>()?;
+            let Some(expected) = records.last().map(|record| record.cursor.clone()) else {
+                continue;
+            };
+            let mut original = Some(records);
+            let last = self.sinks.len() - 1;
+            let mut tasks = JoinSet::new();
+
+            for (index, sink) in self.sinks.iter().enumerate() {
+                let sink = sink.clone();
+                let batch = if index == last {
+                    original.take().expect("the final sink receives the batch")
+                } else {
+                    original
+                        .as_ref()
+                        .expect("the original batch remains until the final sink")
+                        .clone()
+                };
+                tasks.spawn(async move { sink.deliver(batch).await });
+            }
+
+            let failures = drain_fanout(&mut tasks, &expected).await;
+            if !failures.is_empty() {
+                return Err(PipelineError::Sinks(failures));
+            }
+
+            self.source
+                .commit(expected)
+                .await
+                .map_err(PipelineError::Commit)?;
+        }
+        Ok(())
+    }
+}
+
+impl<So, Tr> FanoutPipeline<So, Tr, Shared, Batched>
+where
+    So: Source,
+    So::Cursor: Clone + Eq + Debug + Send + Sync + 'static,
+    Tr: Transform<So::Payload>,
+    Tr::Out: Send + Sync + 'static,
+{
+    pub async fn run_until(
+        self,
+        shutdown: impl Future<Output = ()> + Send,
+    ) -> Result<(), PipelineError<So::Error, Tr::Error, ErasedError>> {
+        if self.sinks.is_empty() {
+            return Err(PipelineError::NoSinks);
+        }
+
+        let transform = &self.transform;
+        let records = self
+            .source
+            .stream()
+            .take_until(shutdown)
+            .map(|item| async move {
+                let Record { cursor, payload } = item.map_err(PipelineError::Source)?;
+                let payload = transform
+                    .apply(payload)
+                    .await
+                    .map_err(PipelineError::Transform)?;
+                Ok(Record::new(cursor, payload))
+            })
+            .buffered(transform.max_concurrency().get());
+        tokio::pin!(records);
+        let chunks = tokio_stream::StreamExt::chunks_timeout(
+            records,
+            self.strategy.policy.size.get(),
+            self.strategy.policy.timeout,
+        );
+        tokio::pin!(chunks);
+
+        while let Some(chunk) = chunks.next().await {
+            let records: Batch<Tr::Out, So::Cursor> =
+                chunk.into_iter().collect::<Result<_, _>>()?;
+            let Some(expected) = records.last().map(|record| record.cursor.clone()) else {
+                continue;
+            };
+            let batch: SharedBatch<Tr::Out, So::Cursor> = Arc::from(records);
+            let mut tasks = JoinSet::new();
+
+            for sink in &self.sinks {
+                let sink = sink.clone();
+                let batch = Arc::clone(&batch);
+                tasks.spawn(async move { sink.deliver(batch).await });
+            }
+
+            let failures = drain_fanout(&mut tasks, &expected).await;
+            if !failures.is_empty() {
+                return Err(PipelineError::Sinks(failures));
+            }
+
+            self.source
+                .commit(expected)
+                .await
+                .map_err(PipelineError::Commit)?;
+        }
+        Ok(())
+    }
+}
+
+async fn drain_fanout<C>(
+    tasks: &mut JoinSet<Result<C, ErasedError>>,
+    expected: &C,
+) -> Vec<DeliveryFailure<ErasedError>>
+where
+    C: Eq + Debug + 'static,
+{
+    let mut failures = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(actual)) if actual == *expected => {}
+            Ok(Ok(actual)) => failures.push(DeliveryFailure::cursor(expected, actual)),
+            Ok(Err(error)) => failures.push(DeliveryFailure::Sink(error)),
+            Err(error) => failures.push(DeliveryFailure::Task(error)),
+        }
+    }
+    failures
 }
