@@ -12,6 +12,13 @@ Source -> transform -> LinearPipeline -> sink -> commit cursor
 Applications import the `penstock` facade. The low-level engine lives in `penstock-core`, while
 `penstock-io` provides opt-in durable checkpoint adapters.
 
+Runnable linear and shared-fanout examples live under `penstock/examples`:
+
+```shell
+cargo run -p penstock --example linear
+cargo run -p penstock --example shared
+```
+
 ## Packages
 
 | Package | Purpose |
