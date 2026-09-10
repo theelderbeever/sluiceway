@@ -9,7 +9,7 @@ members = [
 default-members = ["penstock"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 edition = "2024"
 
 [workspace.dependencies]
@@ -21,13 +21,9 @@ futures-util = {
 }
 metrics = "0.24.2"
 object_store = "0.14.1"
-penstock-contrib = { path = "penstock-contrib", version = "0.1.0" }
-penstock-core = { path = "penstock-core", version = "0.1.0" }
-penstock-io = {
-  path = "penstock-io",
-  version = "0.1.0",
-  default-features = false
-}
+penstock-contrib = { path = "penstock-contrib" }
+penstock-core = { path = "penstock-core" }
+penstock-io = { path = "penstock-io", default-features = false }
 rdkafka = {
   version = "0.39.0",
   default-features = false,

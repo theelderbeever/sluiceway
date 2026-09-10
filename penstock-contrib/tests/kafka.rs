@@ -1,4 +1,5 @@
 #![cfg(feature = "kafka")]
+#![allow(clippy::unwrap_used)]
 
 use std::{
     convert::Infallible,

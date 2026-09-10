@@ -1,19 +1,8 @@
 [package]
 name = "penstock"
-description = "Facade for the Penstock typed linear and fanout pipeline framework"
-edition.workspace = true
 version.workspace = true
-
-[features]
-default = []
-metrics = ["penstock-core/metrics"]
-io = ["dep:penstock-io", "penstock-io/filesystem"]
-object-store = ["io", "penstock-io/object-store"]
-sql-postgres = ["io", "penstock-io/sql-postgres"]
-sql-mysql = ["io", "penstock-io/sql-mysql"]
-sql-sqlite = ["io", "penstock-io/sql-sqlite"]
-sql = ["sql-postgres", "sql-mysql", "sql-sqlite"]
-full = ["metrics", "object-store", "sql"]
+edition.workspace = true
+description = "Facade for the Penstock typed linear and fanout pipeline framework"
 
 [dependencies]
 penstock-core.workspace = true
@@ -24,6 +13,17 @@ futures-core.workspace = true
 futures-util.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[features]
+default = []
+full = ["metrics", "object-store", "sql"]
+io = ["dep:penstock-io", "penstock-io/filesystem"]
+metrics = ["penstock-core/metrics"]
+object-store = ["io", "penstock-io/object-store"]
+sql = ["sql-mysql", "sql-postgres", "sql-sqlite"]
+sql-mysql = ["io", "penstock-io/sql-mysql"]
+sql-postgres = ["io", "penstock-io/sql-postgres"]
+sql-sqlite = ["io", "penstock-io/sql-sqlite"]
 
 [lints]
 workspace = true

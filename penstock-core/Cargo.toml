@@ -1,12 +1,8 @@
 [package]
 name = "penstock-core"
-description = "Core traits and runners for Penstock linear and fanout pipelines"
-edition.workspace = true
 version.workspace = true
-
-[features]
-default = []
-metrics = ["dep:metrics"]
+edition.workspace = true
+description = "Core traits and runners for Penstock linear and fanout pipelines"
 
 [dependencies]
 futures-core.workspace = true
@@ -18,6 +14,10 @@ tokio-stream.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync"] }
+
+[features]
+default = []
+metrics = ["dep:metrics"]
 
 [lints]
 workspace = true

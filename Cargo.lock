@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "penstock"
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -982,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "penstock-contrib"
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "penstock-core"
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "penstock-io"
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "object_store",
  "penstock-core",

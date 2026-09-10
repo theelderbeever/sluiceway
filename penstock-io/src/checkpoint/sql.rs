@@ -290,6 +290,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::unwrap_used)]
     async fn pool() -> Pool<sqlx_sqlite::Sqlite> {
         SqlitePoolOptions::new()
             .max_connections(1)

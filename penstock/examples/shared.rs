@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
+
 use std::{
     convert::Infallible,
     sync::{

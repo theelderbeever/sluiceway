@@ -1,46 +1,8 @@
 [package]
 name = "penstock-io"
-description = "Durable checkpoint adapters for Penstock pipelines"
-edition.workspace = true
 version.workspace = true
-
-[features]
-default = ["filesystem"]
-filesystem = ["dep:serde", "dep:serde_json", "dep:thiserror"]
-object-store = [
-    "dep:object_store",
-    "dep:serde",
-    "dep:serde_json",
-    "dep:thiserror",
-]
-sql-postgres = [
-    "dep:serde",
-    "dep:serde_json",
-    "dep:sqlx-core",
-    "dep:sqlx-postgres",
-    "dep:thiserror",
-    "sqlx-core/_rt-tokio",
-    "sqlx-core/_tls-rustls-ring-native-roots",
-]
-sql-mysql = [
-    "dep:serde",
-    "dep:serde_json",
-    "dep:sqlx-core",
-    "dep:sqlx-mysql",
-    "dep:thiserror",
-    "sqlx-core/_rt-tokio",
-    "sqlx-core/_tls-rustls-ring-native-roots",
-]
-sql-sqlite = [
-    "dep:serde",
-    "dep:serde_json",
-    "dep:sqlx-core",
-    "dep:sqlx-sqlite",
-    "dep:thiserror",
-    "sqlx-core/_rt-tokio",
-    "sqlx-sqlite/bundled",
-]
-sql = ["sql-postgres", "sql-mysql", "sql-sqlite"]
+edition.workspace = true
+description = "Durable checkpoint adapters for Penstock pipelines"
 
 [dependencies]
 object_store = { workspace = true, optional = true }
@@ -56,6 +18,44 @@ thiserror = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[features]
+default = ["filesystem"]
+filesystem = ["dep:serde", "dep:serde_json", "dep:thiserror"]
+object-store = [
+  "dep:object_store",
+  "dep:serde",
+  "dep:serde_json",
+  "dep:thiserror",
+]
+sql = ["sql-mysql", "sql-postgres", "sql-sqlite"]
+sql-mysql = [
+  "dep:serde",
+  "dep:serde_json",
+  "dep:sqlx-core",
+  "dep:sqlx-mysql",
+  "dep:thiserror",
+  "sqlx-core/_rt-tokio",
+  "sqlx-core/_tls-rustls-ring-native-roots",
+]
+sql-postgres = [
+  "dep:serde",
+  "dep:serde_json",
+  "dep:sqlx-core",
+  "dep:sqlx-postgres",
+  "dep:thiserror",
+  "sqlx-core/_rt-tokio",
+  "sqlx-core/_tls-rustls-ring-native-roots",
+]
+sql-sqlite = [
+  "dep:serde",
+  "dep:serde_json",
+  "dep:sqlx-core",
+  "dep:sqlx-sqlite",
+  "dep:thiserror",
+  "sqlx-core/_rt-tokio",
+  "sqlx-sqlite/bundled",
+]
 
 [lints]
 workspace = true

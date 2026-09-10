@@ -1,21 +1,8 @@
 [package]
 name = "penstock-contrib"
-description = "Optional source and sink integrations for Penstock pipelines"
-edition.workspace = true
 version.workspace = true
-
-[features]
-default = []
-kafka = [
-    "dep:futures-core",
-    "dep:futures-util",
-    "dep:penstock-core",
-    "dep:rdkafka",
-    "dep:serde",
-    "dep:serde_json",
-    "dep:thiserror",
-    "dep:tokio",
-]
+edition.workspace = true
+description = "Optional source and sink integrations for Penstock pipelines"
 
 [dependencies]
 futures-core = { workspace = true, optional = true }
@@ -29,6 +16,19 @@ tokio = { workspace = true, features = ["rt", "sync"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[features]
+default = []
+kafka = [
+  "dep:futures-core",
+  "dep:futures-util",
+  "dep:penstock-core",
+  "dep:rdkafka",
+  "dep:serde",
+  "dep:serde_json",
+  "dep:thiserror",
+  "dep:tokio",
+]
 
 [lints]
 workspace = true

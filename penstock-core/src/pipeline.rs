@@ -427,10 +427,8 @@ where
             telemetry::batch(TOPOLOGY, &pipeline_id, batch.len(), reason);
             let cursor = batch.cursor.clone();
             let mut tasks = JoinSet::new();
-            let (last_sink, preceding_sinks) = self
-                .sinks
-                .split_last()
-                .expect("empty fanout is rejected before starting the source");
+            let (last_sink, preceding_sinks) =
+                self.sinks.split_last().ok_or(PipelineError::NoSinks)?;
 
             for sink in preceding_sinks {
                 let sink = sink.clone();
