@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
+
 use std::{convert::Infallible, env, str, time::Duration};
 
 use penstock_contrib::kafka::{ClientConfig, KafkaPosition, KafkaRecord, KafkaSource};
