@@ -99,10 +99,12 @@ source polling when its future resolves; transforms already admitted are complet
 partial batch is flushed.
 
 Transforms run concurrently up to `Transform::max_concurrency` while their outputs remain in the
-source stream's observed order. Batches are delivered one at a time. A batch closes at its size
-limit, at source EOF, or when its timeout expires; the timeout starts when the first transformed
-record enters an empty batch. Sink delivery completes before commit begins, and any transform or
-sink failure prevents that batch's checkpoint from being committed.
+source stream's observed order. Batches are delivered one at a time. By default, the next batch is
+not polled until delivery and commit finish. Configure `.prefetch(count)` on the
+`BatchPolicy` to materialize up to `count` batches concurrently with serial delivery. A batch closes
+at its size limit, at source EOF, or when its timeout expires; the timeout starts when the first
+transformed record enters an empty batch. Sink delivery completes before commit begins, and any
+transform or sink failure prevents that batch's checkpoint from being committed.
 
 Checkpoint adapters are available through facade features. `io` enables local files,
 `object-store` adds caller-configured object stores, and `sql-postgres`, `sql-mysql`, and

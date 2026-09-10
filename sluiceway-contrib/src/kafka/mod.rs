@@ -21,7 +21,8 @@
 //!
 //! The source disables automatic commits and offset storage. It synchronously commits exact
 //! per-partition offsets only after Sluiceway reports successful delivery. Configure
-//! `max.poll.interval.ms` above the worst-case time spent transforming and delivering a batch.
+//! `BatchPolicy::prefetch` to overlap bounded polling with delivery, and keep
+//! `max.poll.interval.ms` above the worst-case pause after that bounded buffer fills.
 //!
 //! Callers that need a custom consumer context can construct the consumer with this module's
 //! re-exported [`rdkafka`] version and pass its `Arc` to [`KafkaSource::from_consumer`]. Retaining

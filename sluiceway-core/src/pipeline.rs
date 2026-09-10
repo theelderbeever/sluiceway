@@ -1,5 +1,6 @@
 use std::{future::Future, marker::PhantomData, num::NonZeroUsize, sync::Arc, time::Duration};
 
+use futures_core::Stream;
 use futures_util::StreamExt;
 use tokio::task::JoinSet;
 
@@ -22,6 +23,7 @@ pub struct Batched {
 pub struct BatchPolicy {
     size: NonZeroUsize,
     timeout: Duration,
+    prefetch: usize,
 }
 
 impl BatchPolicy {
@@ -29,7 +31,11 @@ impl BatchPolicy {
         if timeout.is_zero() {
             return Err(BatchConfigError::ZeroTimeout);
         }
-        Ok(Self { size, timeout })
+        Ok(Self {
+            size,
+            timeout,
+            prefetch: 0,
+        })
     }
 
     pub fn try_new(size: usize, timeout: Duration) -> Result<Self, BatchConfigError> {
@@ -45,12 +51,75 @@ impl BatchPolicy {
         self.timeout
     }
 
+    /// Materialize up to `batches` ahead of the batch currently being delivered.
+    ///
+    /// Prefetching overlaps source polling, transformation, and batching with serial delivery and
+    /// checkpoint commits. The default is zero, which preserves demand-driven processing.
+    pub fn prefetch(mut self, batches: usize) -> Self {
+        self.prefetch = batches;
+        self
+    }
+
     fn emit_reason(self, records: usize) -> &'static str {
         if records == self.size.get() {
             "full"
         } else {
             "timeout"
         }
+    }
+}
+
+async fn drive_batches<S, T, E, Consume, Consuming>(
+    batches: S,
+    prefetch: usize,
+    mut consume: Consume,
+) -> Result<(), E>
+where
+    S: Stream<Item = Result<Option<T>, E>>,
+    Consume: FnMut(T) -> Consuming,
+    Consuming: Future<Output = Result<(), E>>,
+{
+    tokio::pin!(batches);
+
+    if prefetch == 0 {
+        while let Some(batch) = batches.next().await {
+            if let Some(batch) = batch? {
+                consume(batch).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(prefetch);
+    let producer = async move {
+        loop {
+            let Ok(permit) = sender.reserve().await else {
+                return;
+            };
+            match batches.next().await {
+                Some(Ok(Some(batch))) => permit.send(Ok(batch)),
+                Some(Ok(None)) => {}
+                Some(Err(error)) => {
+                    permit.send(Err(error));
+                    return;
+                }
+                None => return,
+            }
+        }
+    };
+    let consumer = async move {
+        while let Some(batch) = receiver.recv().await {
+            consume(batch?).await?;
+        }
+        Ok(())
+    };
+    tokio::pin!(producer);
+    tokio::pin!(consumer);
+
+    tokio::select! {
+        biased;
+        result = &mut consumer => result,
+        () = &mut producer => consumer.await,
     }
 }
 
@@ -273,34 +342,36 @@ where
         );
         tokio::pin!(chunks);
 
-        while let Some(chunk) = chunks.next().await {
-            let Some((batch, checkpoint)) = Batch::from_chunk(chunk, So::track)? else {
-                continue;
-            };
-            let reason = self.strategy.policy.emit_reason(batch.len());
-            telemetry::batch(TOPOLOGY, &pipeline_id, batch.len(), reason);
+        let batches = chunks.map(|chunk| Batch::from_chunk(chunk, So::track));
 
-            let delivery = {
-                let _timer = telemetry::StageTimer::new(TOPOLOGY, "sink", &pipeline_id);
-                self.sink.deliver(batch).await
-            };
-            telemetry::sink_delivery(TOPOLOGY, &pipeline_id, delivery.is_ok());
-            delivery.map_err(|error| {
-                telemetry::error(TOPOLOGY, &pipeline_id, "sink");
-                PipelineError::Sink(DeliveryFailure::Sink(error))
-            })?;
+        drive_batches(
+            batches,
+            self.strategy.policy.prefetch,
+            |(batch, checkpoint)| async {
+                let reason = self.strategy.policy.emit_reason(batch.len());
+                telemetry::batch(TOPOLOGY, &pipeline_id, batch.len(), reason);
+                let delivery = {
+                    let _timer = telemetry::StageTimer::new(TOPOLOGY, "sink", &pipeline_id);
+                    self.sink.deliver(batch).await
+                };
+                telemetry::sink_delivery(TOPOLOGY, &pipeline_id, delivery.is_ok());
+                delivery.map_err(|error| {
+                    telemetry::error(TOPOLOGY, &pipeline_id, "sink");
+                    PipelineError::Sink(DeliveryFailure::Sink(error))
+                })?;
 
-            let commit = {
-                let _timer = telemetry::StageTimer::new(TOPOLOGY, "commit", &pipeline_id);
-                self.source.commit(checkpoint).await
-            };
-            telemetry::commit(TOPOLOGY, &pipeline_id, commit.is_ok());
-            commit.map_err(|error| {
-                telemetry::error(TOPOLOGY, &pipeline_id, "commit");
-                PipelineError::Commit(error)
-            })?;
-        }
-        Ok(())
+                let commit = {
+                    let _timer = telemetry::StageTimer::new(TOPOLOGY, "commit", &pipeline_id);
+                    self.source.commit(checkpoint).await
+                };
+                telemetry::commit(TOPOLOGY, &pipeline_id, commit.is_ok());
+                commit.map_err(|error| {
+                    telemetry::error(TOPOLOGY, &pipeline_id, "commit");
+                    PipelineError::Commit(error)
+                })
+            },
+        )
+        .await
     }
 }
 
@@ -423,49 +494,53 @@ where
         );
         tokio::pin!(chunks);
 
-        while let Some(chunk) = chunks.next().await {
-            let Some((batch, checkpoint)) = Batch::from_chunk(chunk, So::track)? else {
-                continue;
-            };
-            let reason = self.strategy.policy.emit_reason(batch.len());
-            telemetry::batch(TOPOLOGY, &pipeline_id, batch.len(), reason);
-            let mut tasks = JoinSet::new();
-            let (last_sink, preceding_sinks) =
-                self.sinks.split_last().ok_or(PipelineError::NoSinks)?;
+        let batches = chunks.map(|chunk| Batch::from_chunk(chunk, So::track));
 
-            for sink in preceding_sinks {
-                let sink = sink.clone();
-                let batch = batch.clone();
+        drive_batches(
+            batches,
+            self.strategy.policy.prefetch,
+            |(batch, checkpoint)| async {
+                let reason = self.strategy.policy.emit_reason(batch.len());
+                telemetry::batch(TOPOLOGY, &pipeline_id, batch.len(), reason);
+                let mut tasks = JoinSet::new();
+                let (last_sink, preceding_sinks) =
+                    self.sinks.split_last().ok_or(PipelineError::NoSinks)?;
+
+                for sink in preceding_sinks {
+                    let sink = sink.clone();
+                    let batch = batch.clone();
+                    let delivery_pipeline_id = pipeline_id.clone();
+                    tasks.spawn(async move {
+                        let _timer =
+                            telemetry::StageTimer::new(TOPOLOGY, "sink", &delivery_pipeline_id);
+                        sink.deliver(batch).await
+                    });
+                }
+                let sink = last_sink.clone();
                 let delivery_pipeline_id = pipeline_id.clone();
                 tasks.spawn(async move {
                     let _timer =
                         telemetry::StageTimer::new(TOPOLOGY, "sink", &delivery_pipeline_id);
                     sink.deliver(batch).await
                 });
-            }
-            let sink = last_sink.clone();
-            let delivery_pipeline_id = pipeline_id.clone();
-            tasks.spawn(async move {
-                let _timer = telemetry::StageTimer::new(TOPOLOGY, "sink", &delivery_pipeline_id);
-                sink.deliver(batch).await
-            });
 
-            let failures = Self::drain(&mut tasks, TOPOLOGY, &pipeline_id).await;
-            if !failures.is_empty() {
-                return Err(PipelineError::Sinks(failures));
-            }
+                let failures = Self::drain(&mut tasks, TOPOLOGY, &pipeline_id).await;
+                if !failures.is_empty() {
+                    return Err(PipelineError::Sinks(failures));
+                }
 
-            let commit = {
-                let _timer = telemetry::StageTimer::new(TOPOLOGY, "commit", &pipeline_id);
-                self.source.commit(checkpoint).await
-            };
-            telemetry::commit(TOPOLOGY, &pipeline_id, commit.is_ok());
-            commit.map_err(|error| {
-                telemetry::error(TOPOLOGY, &pipeline_id, "commit");
-                PipelineError::Commit(error)
-            })?;
-        }
-        Ok(())
+                let commit = {
+                    let _timer = telemetry::StageTimer::new(TOPOLOGY, "commit", &pipeline_id);
+                    self.source.commit(checkpoint).await
+                };
+                telemetry::commit(TOPOLOGY, &pipeline_id, commit.is_ok());
+                commit.map_err(|error| {
+                    telemetry::error(TOPOLOGY, &pipeline_id, "commit");
+                    PipelineError::Commit(error)
+                })
+            },
+        )
+        .await
     }
 }
 
@@ -525,41 +600,44 @@ where
         );
         tokio::pin!(chunks);
 
-        while let Some(chunk) = chunks.next().await {
-            let Some((batch, checkpoint)) = Batch::from_chunk(chunk, So::track)? else {
-                continue;
-            };
-            let reason = self.strategy.policy.emit_reason(batch.len());
-            telemetry::batch(TOPOLOGY, &pipeline_id, batch.len(), reason);
-            let batch: SharedBatch<Tr::Out, So::Position> = Arc::new(batch);
-            let mut tasks = JoinSet::new();
+        let batches = chunks.map(|chunk| Batch::from_chunk(chunk, So::track));
 
-            for sink in &self.sinks {
-                let sink = sink.clone();
-                let batch = Arc::clone(&batch);
-                let delivery_pipeline_id = pipeline_id.clone();
-                tasks.spawn(async move {
-                    let _timer =
-                        telemetry::StageTimer::new(TOPOLOGY, "sink", &delivery_pipeline_id);
-                    sink.deliver(batch).await
-                });
-            }
+        drive_batches(
+            batches,
+            self.strategy.policy.prefetch,
+            |(batch, checkpoint)| async {
+                let reason = self.strategy.policy.emit_reason(batch.len());
+                telemetry::batch(TOPOLOGY, &pipeline_id, batch.len(), reason);
+                let batch: SharedBatch<Tr::Out, So::Position> = Arc::new(batch);
+                let mut tasks = JoinSet::new();
 
-            let failures = Self::drain(&mut tasks, TOPOLOGY, &pipeline_id).await;
-            if !failures.is_empty() {
-                return Err(PipelineError::Sinks(failures));
-            }
+                for sink in &self.sinks {
+                    let sink = sink.clone();
+                    let batch = Arc::clone(&batch);
+                    let delivery_pipeline_id = pipeline_id.clone();
+                    tasks.spawn(async move {
+                        let _timer =
+                            telemetry::StageTimer::new(TOPOLOGY, "sink", &delivery_pipeline_id);
+                        sink.deliver(batch).await
+                    });
+                }
 
-            let commit = {
-                let _timer = telemetry::StageTimer::new(TOPOLOGY, "commit", &pipeline_id);
-                self.source.commit(checkpoint).await
-            };
-            telemetry::commit(TOPOLOGY, &pipeline_id, commit.is_ok());
-            commit.map_err(|error| {
-                telemetry::error(TOPOLOGY, &pipeline_id, "commit");
-                PipelineError::Commit(error)
-            })?;
-        }
-        Ok(())
+                let failures = Self::drain(&mut tasks, TOPOLOGY, &pipeline_id).await;
+                if !failures.is_empty() {
+                    return Err(PipelineError::Sinks(failures));
+                }
+
+                let commit = {
+                    let _timer = telemetry::StageTimer::new(TOPOLOGY, "commit", &pipeline_id);
+                    self.source.commit(checkpoint).await
+                };
+                telemetry::commit(TOPOLOGY, &pipeline_id, commit.is_ok());
+                commit.map_err(|error| {
+                    telemetry::error(TOPOLOGY, &pipeline_id, "commit");
+                    PipelineError::Commit(error)
+                })
+            },
+        )
+        .await
     }
 }

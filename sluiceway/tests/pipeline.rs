@@ -209,6 +209,120 @@ async fn linear_pipeline_moves_owned_transformed_batches_to_one_sink() {
     );
 }
 
+struct PollCountingSource {
+    records: usize,
+    polled: Arc<AtomicUsize>,
+}
+
+impl Source for PollCountingSource {
+    type Payload = u64;
+    type Position = Cursor;
+    type Checkpoint = Cursor;
+    type Error = Infallible;
+
+    fn stream(
+        &self,
+    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_
+    {
+        let polled = Arc::clone(&self.polled);
+        stream::iter(
+            (0..self.records)
+                .map(|offset| Ok(Record::new(Cursor::at(offset as u64), offset as u64))),
+        )
+        .inspect(move |_| {
+            polled.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+
+    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
+        position.clone()
+    }
+
+    async fn commit(&self, _checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+struct BlockingFirstSink {
+    deliveries: AtomicUsize,
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl Sink<Batch<u64, Cursor>> for BlockingFirstSink {
+    type Error = Infallible;
+
+    async fn deliver(&self, _batch: Batch<u64, Cursor>) -> Result<(), Self::Error> {
+        if self.deliveries.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn prefetch_materializes_the_configured_number_of_batches_during_delivery() {
+    let polled = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let pipeline = Pipeline::source(PollCountingSource {
+        records: 4,
+        polled: Arc::clone(&polled),
+    })
+    .transform(Identity)
+    .sink(BlockingFirstSink {
+        deliveries: AtomicUsize::new(0),
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    })
+    .batched(
+        BatchPolicy::try_new(1, Duration::from_secs(1))
+            .unwrap()
+            .prefetch(2),
+    );
+    let running = tokio::spawn(pipeline.run());
+
+    started.notified().await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while polled.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("two batches should be prefetched");
+    assert_eq!(polled.load(Ordering::SeqCst), 3);
+
+    release.notify_one();
+    running.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn batching_does_not_prefetch_by_default() {
+    let polled = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let pipeline = Pipeline::source(PollCountingSource {
+        records: 2,
+        polled: Arc::clone(&polled),
+    })
+    .transform(Identity)
+    .sink(BlockingFirstSink {
+        deliveries: AtomicUsize::new(0),
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    })
+    .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap());
+    let running = tokio::spawn(pipeline.run());
+
+    started.notified().await;
+    tokio::task::yield_now().await;
+    assert_eq!(polled.load(Ordering::SeqCst), 1);
+
+    release.notify_one();
+    running.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn transform_can_use_the_position_retained_for_delivery() {
     let (source, _) = source(vec![40, 40]);
@@ -244,7 +358,11 @@ async fn cloned_fanout_reuses_owned_sinks() {
         .fanout()
         .cloned()
         .sinks([collector.into(), counter.into()])
-        .batched(BatchPolicy::try_new(2, Duration::from_secs(1)).unwrap())
+        .batched(
+            BatchPolicy::try_new(2, Duration::from_secs(1))
+                .unwrap()
+                .prefetch(1),
+        )
         .run()
         .await
         .unwrap();
@@ -326,7 +444,11 @@ async fn fanout_accepts_heterogeneous_array_and_shares_whole_batches() {
         .fanout()
         .shared()
         .sinks([first.into(), second.into(), counter.into()])
-        .batched(BatchPolicy::try_new(2, Duration::from_secs(1)).unwrap())
+        .batched(
+            BatchPolicy::try_new(2, Duration::from_secs(1))
+                .unwrap()
+                .prefetch(1),
+        )
         .run_until(std::future::pending())
         .await
         .unwrap();
