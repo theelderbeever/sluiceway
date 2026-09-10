@@ -11,7 +11,7 @@ default-members = ["sluiceway"]
 [workspace.package]
 version = "0.1.0-alpha.1"
 edition = "2024"
-repository = "https://github.com/theelderbeever/penstock"
+repository = "https://github.com/theelderbeever/sluiceway"
 license = "MIT"
 
 [workspace.dependencies]
