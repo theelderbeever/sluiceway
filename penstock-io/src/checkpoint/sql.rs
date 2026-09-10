@@ -82,12 +82,12 @@ fn validated_identifier(
     }
 }
 
-fn encode_cursor<C: Serialize>(cursor: &C) -> Result<String, SqlCheckpointError> {
-    serde_json::to_string(cursor).map_err(Into::into)
+fn encode_checkpoint<Cp: Serialize>(checkpoint: &Cp) -> Result<String, SqlCheckpointError> {
+    serde_json::to_string(checkpoint).map_err(Into::into)
 }
 
-fn decode_cursor<C: DeserializeOwned>(cursor: String) -> Result<C, SqlCheckpointError> {
-    serde_json::from_str(&cursor).map_err(Into::into)
+fn decode_checkpoint<Cp: DeserializeOwned>(checkpoint: String) -> Result<Cp, SqlCheckpointError> {
+    serde_json::from_str(&checkpoint).map_err(Into::into)
 }
 
 #[cfg(feature = "sql-postgres")]
@@ -124,32 +124,32 @@ impl SqlCheckpoint<sqlx_postgres::Postgres> {
 }
 
 #[cfg(feature = "sql-postgres")]
-impl<C> CheckpointStore<C> for SqlCheckpoint<sqlx_postgres::Postgres>
+impl<Cp> CheckpointStore<Cp> for SqlCheckpoint<sqlx_postgres::Postgres>
 where
-    C: DeserializeOwned + Serialize + Sync,
+    Cp: DeserializeOwned + Serialize + Sync,
 {
     type Error = SqlCheckpointError;
 
-    async fn load(&self) -> Result<Option<C>, Self::Error> {
-        let cursor: Option<String> = sqlx_core::query_scalar::query_scalar(&format!(
+    async fn load(&self) -> Result<Option<Cp>, Self::Error> {
+        let checkpoint: Option<String> = sqlx_core::query_scalar::query_scalar(&format!(
             "SELECT \"cursor\" FROM {} WHERE \"pipeline_id\" = $1",
             self.qualified_table()
         ))
         .bind(self.pipeline_id.as_str())
         .fetch_optional(&self.pool)
         .await?;
-        cursor.map(decode_cursor).transpose()
+        checkpoint.map(decode_checkpoint).transpose()
     }
 
-    async fn save(&self, cursor: &C) -> Result<(), Self::Error> {
-        let cursor = encode_cursor(cursor)?;
+    async fn save(&self, checkpoint: &Cp) -> Result<(), Self::Error> {
+        let checkpoint = encode_checkpoint(checkpoint)?;
         sqlx_core::query::query(&format!(
             "INSERT INTO {} (\"pipeline_id\", \"cursor\") VALUES ($1, $2) \
              ON CONFLICT (\"pipeline_id\") DO UPDATE SET \"cursor\" = EXCLUDED.\"cursor\"",
             self.qualified_table()
         ))
         .bind(self.pipeline_id.as_str())
-        .bind(cursor)
+        .bind(checkpoint)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -181,32 +181,32 @@ impl SqlCheckpoint<sqlx_mysql::MySql> {
 }
 
 #[cfg(feature = "sql-mysql")]
-impl<C> CheckpointStore<C> for SqlCheckpoint<sqlx_mysql::MySql>
+impl<Cp> CheckpointStore<Cp> for SqlCheckpoint<sqlx_mysql::MySql>
 where
-    C: DeserializeOwned + Serialize + Sync,
+    Cp: DeserializeOwned + Serialize + Sync,
 {
     type Error = SqlCheckpointError;
 
-    async fn load(&self) -> Result<Option<C>, Self::Error> {
-        let cursor: Option<String> = sqlx_core::query_scalar::query_scalar(&format!(
+    async fn load(&self) -> Result<Option<Cp>, Self::Error> {
+        let checkpoint: Option<String> = sqlx_core::query_scalar::query_scalar(&format!(
             "SELECT `cursor` FROM {} WHERE `pipeline_id` = ?",
             self.quoted_table()
         ))
         .bind(self.pipeline_id.as_str())
         .fetch_optional(&self.pool)
         .await?;
-        cursor.map(decode_cursor).transpose()
+        checkpoint.map(decode_checkpoint).transpose()
     }
 
-    async fn save(&self, cursor: &C) -> Result<(), Self::Error> {
-        let cursor = encode_cursor(cursor)?;
+    async fn save(&self, checkpoint: &Cp) -> Result<(), Self::Error> {
+        let checkpoint = encode_checkpoint(checkpoint)?;
         sqlx_core::query::query(&format!(
             "INSERT INTO {} (`pipeline_id`, `cursor`) VALUES (?, ?) \
              ON DUPLICATE KEY UPDATE `cursor` = VALUES(`cursor`)",
             self.quoted_table()
         ))
         .bind(self.pipeline_id.as_str())
-        .bind(cursor)
+        .bind(checkpoint)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -238,32 +238,32 @@ impl SqlCheckpoint<sqlx_sqlite::Sqlite> {
 }
 
 #[cfg(feature = "sql-sqlite")]
-impl<C> CheckpointStore<C> for SqlCheckpoint<sqlx_sqlite::Sqlite>
+impl<Cp> CheckpointStore<Cp> for SqlCheckpoint<sqlx_sqlite::Sqlite>
 where
-    C: DeserializeOwned + Serialize + Sync,
+    Cp: DeserializeOwned + Serialize + Sync,
 {
     type Error = SqlCheckpointError;
 
-    async fn load(&self) -> Result<Option<C>, Self::Error> {
-        let cursor: Option<String> = sqlx_core::query_scalar::query_scalar(&format!(
+    async fn load(&self) -> Result<Option<Cp>, Self::Error> {
+        let checkpoint: Option<String> = sqlx_core::query_scalar::query_scalar(&format!(
             "SELECT \"cursor\" FROM {} WHERE \"pipeline_id\" = ?",
             self.quoted_table()
         ))
         .bind(self.pipeline_id.as_str())
         .fetch_optional(&self.pool)
         .await?;
-        cursor.map(decode_cursor).transpose()
+        checkpoint.map(decode_checkpoint).transpose()
     }
 
-    async fn save(&self, cursor: &C) -> Result<(), Self::Error> {
-        let cursor = encode_cursor(cursor)?;
+    async fn save(&self, checkpoint: &Cp) -> Result<(), Self::Error> {
+        let checkpoint = encode_checkpoint(checkpoint)?;
         sqlx_core::query::query(&format!(
             "INSERT INTO {} (\"pipeline_id\", \"cursor\") VALUES (?, ?) \
              ON CONFLICT (\"pipeline_id\") DO UPDATE SET \"cursor\" = EXCLUDED.\"cursor\"",
             self.quoted_table()
         ))
         .bind(self.pipeline_id.as_str())
-        .bind(cursor)
+        .bind(checkpoint)
         .execute(&self.pool)
         .await?;
         Ok(())

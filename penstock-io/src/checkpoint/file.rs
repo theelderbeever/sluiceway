@@ -52,23 +52,23 @@ impl FileCheckpoint {
     }
 }
 
-impl<C> CheckpointStore<C> for FileCheckpoint
+impl<Cp> CheckpointStore<Cp> for FileCheckpoint
 where
-    C: DeserializeOwned + Serialize + Sync,
+    Cp: DeserializeOwned + Serialize + Sync,
 {
     type Error = FileCheckpointError;
 
-    async fn load(&self) -> Result<Option<C>, Self::Error> {
+    async fn load(&self) -> Result<Option<Cp>, Self::Error> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let stored: StoredCheckpoint<C> = serde_json::from_slice(&bytes)?;
+        let stored: StoredCheckpoint<Cp> = serde_json::from_slice(&bytes)?;
         Ok(Some(stored.cursor))
     }
 
-    async fn save(&self, cursor: &C) -> Result<(), Self::Error> {
+    async fn save(&self, checkpoint: &Cp) -> Result<(), Self::Error> {
         if let Some(parent) = self
             .path
             .parent()
@@ -77,7 +77,7 @@ where
             fs::create_dir_all(parent)?;
         }
 
-        let body = serde_json::to_vec(&StoredCheckpoint { cursor })?;
+        let body = serde_json::to_vec(&StoredCheckpoint { cursor: checkpoint })?;
         loop {
             let temporary_path = self.temporary_path();
             let mut temporary = match OpenOptions::new()

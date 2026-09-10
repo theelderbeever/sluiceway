@@ -1,8 +1,8 @@
 //! Durable checkpoint adapters for Penstock pipelines.
 //!
 //! The default `filesystem` feature provides [`FileCheckpoint`]. Remote object-store and SQL
-//! checkpoints are independently feature gated. Every adapter stores cursors as JSON and works
-//! with any cursor implementing Serde's serialization traits.
+//! checkpoints are independently feature gated. Every adapter stores checkpoints as JSON and works
+//! with any checkpoint implementing Serde's serialization traits.
 
 pub mod checkpoint;
 

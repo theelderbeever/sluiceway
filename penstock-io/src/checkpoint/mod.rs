@@ -1,4 +1,4 @@
-//! Durable cursor checkpoints.
+//! Durable source checkpoints.
 
 #[cfg(feature = "filesystem")]
 mod file;

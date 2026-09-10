@@ -3,35 +3,54 @@
 
 use std::{
     convert::Infallible,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
-use penstock_contrib::kafka::{ClientConfig, KafkaCursor, KafkaMessage, KafkaSource};
+use penstock_contrib::kafka::{ClientConfig, KafkaPosition, KafkaRecord, KafkaSource};
 use penstock_core::{Batch, BatchPolicy, Identity, Pipeline, PipelineError, Sink};
 use rdkafka::{
+    ClientContext,
+    consumer::{BaseConsumer, Consumer, ConsumerContext, Rebalance, StreamConsumer},
     mocking::MockCluster,
     producer::{FutureProducer, FutureRecord},
+    topic_partition_list::{Offset, TopicPartitionList},
     util::Timeout,
 };
 use thiserror::Error;
 use tokio::sync::Notify;
 
-type RawMessages = Arc<Mutex<Vec<KafkaMessage<Option<Vec<u8>>>>>>;
+type DecodedMessages = Arc<Mutex<Vec<(i32, Option<()>, Option<Vec<u8>>)>>>;
+type IgnoredKeyRecord = KafkaRecord<(), Vec<u8>>;
+type BytesRecord = KafkaRecord<Vec<u8>, Vec<u8>>;
 
 struct CollectSink {
-    messages: RawMessages,
+    messages: DecodedMessages,
     delivered: Arc<Notify>,
 }
 
-impl Sink<Batch<KafkaMessage<Option<Vec<u8>>>, KafkaCursor>> for CollectSink {
+impl Sink<Batch<IgnoredKeyRecord, KafkaPosition>> for CollectSink {
     type Error = Infallible;
 
     async fn deliver(
         &self,
-        batch: Batch<KafkaMessage<Option<Vec<u8>>>, KafkaCursor>,
+        batch: Batch<IgnoredKeyRecord, KafkaPosition>,
     ) -> Result<(), Self::Error> {
-        self.messages.lock().unwrap().extend(batch);
+        self.messages
+            .lock()
+            .unwrap()
+            .extend(batch.into_iter().map(|record| {
+                let partition = record.position().partition;
+                let message = record.payload;
+                (
+                    partition,
+                    message.key.transpose().unwrap(),
+                    message.payload.transpose().unwrap(),
+                )
+            }));
         self.delivered.notify_one();
         Ok(())
     }
@@ -43,27 +62,25 @@ struct RejectBatch;
 
 struct RejectSink;
 
-impl Sink<Batch<KafkaMessage<Option<Vec<u8>>>, KafkaCursor>> for RejectSink {
+impl Sink<Batch<BytesRecord, KafkaPosition>> for RejectSink {
     type Error = RejectBatch;
 
-    async fn deliver(
-        &self,
-        _batch: Batch<KafkaMessage<Option<Vec<u8>>>, KafkaCursor>,
-    ) -> Result<(), Self::Error> {
+    async fn deliver(&self, _batch: Batch<BytesRecord, KafkaPosition>) -> Result<(), Self::Error> {
         Err(RejectBatch)
     }
 }
 
-struct JsonSink;
+struct TestContext {
+    rebalanced: Arc<AtomicBool>,
+}
 
-impl Sink<Batch<KafkaMessage<Vec<u64>>, KafkaCursor>> for JsonSink {
-    type Error = Infallible;
+impl ClientContext for TestContext {}
 
-    async fn deliver(
-        &self,
-        _batch: Batch<KafkaMessage<Vec<u64>>, KafkaCursor>,
-    ) -> Result<(), Self::Error> {
-        Ok(())
+impl ConsumerContext for TestContext {
+    fn post_rebalance(&self, _consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
+        if matches!(rebalance, Rebalance::Assign(_)) {
+            self.rebalanced.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -90,16 +107,18 @@ async fn produce(producer: &FutureProducer, topic: &str, partition: i32, payload
         .unwrap();
 }
 
+fn bytes(value: &[u8]) -> Result<Vec<u8>, Infallible> {
+    Ok(value.to_vec())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "librdkafka's experimental mock cluster is unreliable after other test processes"]
-async fn broker_checkpoint_contract() {
+async fn broker_committer_contract() {
     const SUCCESS_TOPIC: &str = "successful-batch";
     const REJECTED_TOPIC: &str = "rejected-batch";
-    const MALFORMED_TOPIC: &str = "malformed-json";
     let cluster = MockCluster::new(1).unwrap();
     cluster.create_topic(SUCCESS_TOPIC, 2, 1).unwrap();
     cluster.create_topic(REJECTED_TOPIC, 1, 1).unwrap();
-    cluster.create_topic(MALFORMED_TOPIC, 1, 1).unwrap();
     let bootstrap_servers = cluster.bootstrap_servers();
     // librdkafka 2.12.1 can double-destroy explicitly owned mock clusters during teardown.
     // Keep the test broker alive until process exit; no production resource is leaked.
@@ -111,13 +130,23 @@ async fn broker_checkpoint_contract() {
     produce(&producer, SUCCESS_TOPIC, 0, "zero").await;
     produce(&producer, SUCCESS_TOPIC, 1, "one").await;
     produce(&producer, REJECTED_TOPIC, 0, "retry-me").await;
-    produce(&producer, MALFORMED_TOPIC, 0, "not-json").await;
 
-    let source = KafkaSource::raw(
-        consumer_config(&bootstrap_servers, "successful-batch-group"),
-        &[SUCCESS_TOPIC],
-    )
-    .unwrap();
+    let rebalanced = Arc::new(AtomicBool::new(false));
+    let mut config = consumer_config(&bootstrap_servers, "successful-batch-group");
+    config
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false");
+    let consumer: Arc<StreamConsumer<TestContext>> = Arc::new(
+        config
+            .create_with_context(TestContext {
+                rebalanced: Arc::clone(&rebalanced),
+            })
+            .unwrap(),
+    );
+    consumer.subscribe(&[SUCCESS_TOPIC]).unwrap();
+    let source = KafkaSource::from_consumer(Arc::clone(&consumer))
+        .payload_deserializer(bytes)
+        .build();
     let messages = Arc::new(Mutex::new(Vec::new()));
     let delivered = Arc::new(Notify::new());
     let sink = CollectSink {
@@ -136,20 +165,40 @@ async fn broker_checkpoint_contract() {
     .unwrap()
     .unwrap();
 
-    let mut partitions = messages
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|message| message.partition)
-        .collect::<Vec<_>>();
-    partitions.sort_unstable();
-    assert_eq!(partitions, vec![0, 1]);
+    let mut messages = messages.lock().unwrap().clone();
+    messages.sort_unstable_by_key(|message| message.0);
+    assert_eq!(
+        messages,
+        vec![
+            (0, Some(()), Some(b"zero".to_vec())),
+            (1, Some(()), Some(b"one".to_vec())),
+        ]
+    );
+    assert!(rebalanced.load(Ordering::SeqCst));
 
-    let source = KafkaSource::raw(
+    let mut requested = TopicPartitionList::new();
+    requested.add_partition(SUCCESS_TOPIC, 0);
+    requested.add_partition(SUCCESS_TOPIC, 1);
+    let committed = consumer
+        .committed_offsets(requested, Timeout::After(Duration::from_secs(5)))
+        .unwrap();
+    assert_eq!(
+        committed.find_partition(SUCCESS_TOPIC, 0).unwrap().offset(),
+        Offset::Offset(1)
+    );
+    assert_eq!(
+        committed.find_partition(SUCCESS_TOPIC, 1).unwrap().offset(),
+        Offset::Offset(1)
+    );
+
+    let source = KafkaSource::from_config(
         consumer_config(&bootstrap_servers, "rejected-batch-group"),
         &[REJECTED_TOPIC],
     )
-    .unwrap();
+    .unwrap()
+    .key_deserializer(bytes)
+    .payload_deserializer(bytes)
+    .build();
     let result = tokio::time::timeout(
         Duration::from_secs(15),
         Pipeline::source(source)
@@ -161,21 +210,4 @@ async fn broker_checkpoint_contract() {
     .await
     .unwrap();
     assert!(matches!(result, Err(PipelineError::Sink(_))));
-
-    let source = KafkaSource::json::<Vec<u64>>(
-        consumer_config(&bootstrap_servers, "malformed-json-group"),
-        &[MALFORMED_TOPIC],
-    )
-    .unwrap();
-    let result = tokio::time::timeout(
-        Duration::from_secs(15),
-        Pipeline::source(source)
-            .transform(Identity)
-            .sink(JsonSink)
-            .batched(BatchPolicy::try_new(1, Duration::from_secs(5)).unwrap())
-            .run_until(std::future::pending()),
-    )
-    .await
-    .unwrap();
-    assert!(matches!(result, Err(PipelineError::Source(_))));
 }
