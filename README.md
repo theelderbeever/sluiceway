@@ -1,6 +1,6 @@
-# Penstock
+# Sluiceway
 
-Penstock is a typed, Tokio-based framework for ordered pipelines. A transformed batch is either
+Sluiceway is a typed, Tokio-based framework for ordered pipelines. A transformed batch is either
 moved into one sink or shared with a fanout of type-erased sinks:
 
 ```text
@@ -9,34 +9,34 @@ Source -> transform -> LinearPipeline -> sink -> commit checkpoint
                                     `-> sink --+-> commit checkpoint
 ```
 
-Applications import the `penstock` facade. The low-level engine lives in `penstock-core`, while
-`penstock-io` provides opt-in durable checkpoint adapters.
+Applications import the `sluiceway` facade. The low-level engine lives in `sluiceway-core`, while
+`sluiceway-io` provides opt-in durable checkpoint adapters.
 
-Runnable linear and shared-fanout examples live under `penstock/examples`:
+Runnable linear and shared-fanout examples live under `sluiceway/examples`:
 
 ```shell
-cargo run -p penstock --example linear
-cargo run -p penstock --example shared
+cargo run -p sluiceway --example linear
+cargo run -p sluiceway --example shared
 ```
 
 ## Packages
 
 | Package | Purpose |
 | --- | --- |
-| `penstock` | Public facade and feature-gated adapter re-exports |
-| `penstock-core` | Records, sources, transforms, sinks, checkpoints, and runners |
-| `penstock-io` | Filesystem, object-store, and SQL checkpoint adapters |
-| `penstock-contrib` | Feature-gated external source and sink integrations |
+| `sluiceway` | Public facade and feature-gated adapter re-exports |
+| `sluiceway-core` | Records, sources, transforms, sinks, checkpoints, and runners |
+| `sluiceway-io` | Filesystem, object-store, and SQL checkpoint adapters |
+| `sluiceway-contrib` | Feature-gated external source and sink integrations |
 
 A linear sink owns and consumes each batch:
 
 ```rust,no_run
 use std::{convert::Infallible, time::Duration};
-use penstock::{Batch, BatchPolicy, Pipeline, PipelineId, Sink};
+use sluiceway::{Batch, BatchPolicy, Pipeline, PipelineId, Sink};
 
 # async fn run<S, K>(source: S, sink: K) -> Result<(), Box<dyn std::error::Error>>
 # where
-#     S: penstock::Source<Payload = Vec<u8>>,
+#     S: sluiceway::Source<Payload = Vec<u8>>,
 #     K: Sink<Batch<usize, S::Position>>,
 #     S::Error: 'static,
 # {
@@ -58,10 +58,10 @@ fanout boundary, allowing heterogeneous sinks in one array:
 
 ```rust,no_run
 # use std::{convert::Infallible, time::Duration};
-# use penstock::{BatchPolicy, Pipeline, SharedBatch, Sink};
+# use sluiceway::{BatchPolicy, Pipeline, SharedBatch, Sink};
 # async fn run<S, A, B>(source: S, analytics: A, archive: B) -> Result<(), Box<dyn std::error::Error>>
 # where
-#     S: penstock::Source<Payload = Vec<u8>>,
+#     S: sluiceway::Source<Payload = Vec<u8>>,
 #     S::Error: 'static,
 #     A: Sink<SharedBatch<Vec<u8>, S::Position>> + 'static,
 #     B: Sink<SharedBatch<Vec<u8>, S::Position>> + 'static,
@@ -112,29 +112,29 @@ can be used when they implement Serde's `Serialize` and `DeserializeOwned` trait
 ## Metrics
 
 Enable the facade's `metrics` feature to emit pipeline metrics through the
-[`metrics`](https://crates.io/crates/metrics) facade. Penstock does not install a recorder; the
+[`metrics`](https://crates.io/crates/metrics) facade. Sluiceway does not install a recorder; the
 application chooses and configures one (for example, a Prometheus exporter).
 
 ```toml
-penstock = { version = "0.1.0", features = ["metrics"] }
+sluiceway = { version = "0.1.0", features = ["metrics"] }
 ```
 
 Metric names and labels are intentionally bounded:
 
 | Metric | Kind | Labels |
 | --- | --- | --- |
-| `penstock_pipeline_active` | gauge | `pipeline_id`, `topology` |
-| `penstock_records_total` | counter | `pipeline_id`, `topology` |
-| `penstock_batches_total` | counter | `pipeline_id`, `topology`, `reason` |
-| `penstock_batch_records` | histogram | `pipeline_id`, `topology` |
-| `penstock_sink_deliveries_total` | counter | `pipeline_id`, `topology`, `status` |
-| `penstock_commits_total` | counter | `pipeline_id`, `topology`, `status` |
-| `penstock_errors_total` | counter | `pipeline_id`, `topology`, `stage` |
-| `penstock_stage_duration_seconds` | histogram | `pipeline_id`, `topology`, `stage` |
+| `sluiceway_pipeline_active` | gauge | `pipeline_id`, `topology` |
+| `sluiceway_records_total` | counter | `pipeline_id`, `topology` |
+| `sluiceway_batches_total` | counter | `pipeline_id`, `topology`, `reason` |
+| `sluiceway_batch_records` | histogram | `pipeline_id`, `topology` |
+| `sluiceway_sink_deliveries_total` | counter | `pipeline_id`, `topology`, `status` |
+| `sluiceway_commits_total` | counter | `pipeline_id`, `topology`, `status` |
+| `sluiceway_errors_total` | counter | `pipeline_id`, `topology`, `stage` |
+| `sluiceway_stage_duration_seconds` | histogram | `pipeline_id`, `topology`, `stage` |
 
 `topology` is one of `linear`, `fanout_cloned`, or `fanout_shared`. Stage durations cover
 transforms, individual sink deliveries, and checkpoint commits. Metrics emission is compiled out when
-the feature is disabled, and the optional dependency is omitted. `penstock-core` users can enable
+the feature is disabled, and the optional dependency is omitted. `sluiceway-core` users can enable
 its feature directly. Construct a stable `PipelineId` once and pass a clone to both `Pipeline::id`
 and `SqlCheckpoint::with_id` to correlate metrics with durable progress. Pipelines without a
 configured identity use the fixed `unnamed` label. The batch `reason` is `full` or `timeout`;
@@ -143,13 +143,13 @@ partial batches flushed when the source ends are included in `timeout`.
 when the value is constructed and does not need to be checked again by checkpoint or metrics code.
 
 Kafka-compatible consumers, including Redpanda, are available from the separate
-`penstock-contrib` crate with its `kafka` feature. The required payload deserializer and optional
+`sluiceway-contrib` crate with its `kafka` feature. The required payload deserializer and optional
 key deserializer run directly against librdkafka's borrowed byte slices, so large payloads are not
 copied before decoding. Without a key deserializer, keys are discarded and the record key type is
 `()`. The source emits owned typed records with Kafka metadata and commits consumer-group offsets
 only after the pipeline's sinks acknowledge a batch.
 
-`penstock-contrib/examples/kafka_json.rs` demonstrates configuring key and JSON payload
+`sluiceway-contrib/examples/kafka_json.rs` demonstrates configuring key and JSON payload
 deserializers on the source. Run it with
-`cargo run -p penstock-contrib --features kafka --example kafka_json` and optionally set
+`cargo run -p sluiceway-contrib --features kafka --example kafka_json` and optionally set
 `KAFKA_BOOTSTRAP_SERVERS` and `KAFKA_TOPIC`.

@@ -1,16 +1,18 @@
 [workspace]
 resolver = "3"
 members = [
-  "penstock",
-  "penstock-contrib",
-  "penstock-core",
-  "penstock-io",
+  "sluiceway",
+  "sluiceway-contrib",
+  "sluiceway-core",
+  "sluiceway-io",
 ]
-default-members = ["penstock"]
+default-members = ["sluiceway"]
 
 [workspace.package]
 version = "0.1.0-alpha.1"
 edition = "2024"
+repository = "https://github.com/theelderbeever/penstock"
+license = "MIT"
 
 [workspace.dependencies]
 futures-core = "0.3.33"
@@ -21,9 +23,6 @@ futures-util = {
 }
 metrics = "0.24.2"
 object_store = "0.14.1"
-penstock-contrib = { path = "penstock-contrib" }
-penstock-core = { path = "penstock-core" }
-penstock-io = { path = "penstock-io", default-features = false }
 rdkafka = {
   version = "0.39.0",
   default-features = false,
@@ -31,6 +30,12 @@ rdkafka = {
 }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sluiceway-core = { path = "sluiceway-core", version = "0.1.0-alpha.1" }
+sluiceway-io = {
+  path = "sluiceway-io",
+  version = "0.1.0-alpha.1",
+  default-features = false,
+}
 sqlx-core = { version = "=0.8.6", default-features = false }
 sqlx-mysql = { version = "=0.8.6", default-features = false }
 sqlx-postgres = { version = "=0.8.6", default-features = false }

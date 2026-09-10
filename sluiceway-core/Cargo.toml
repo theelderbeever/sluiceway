@@ -1,0 +1,25 @@
+[package]
+name = "sluiceway-core"
+version.workspace = true
+edition.workspace = true
+description = "Core traits and runners for Sluiceway linear and fanout pipelines"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+futures-core.workspace = true
+futures-util.workspace = true
+metrics = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio-stream.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync"] }
+
+[features]
+default = []
+metrics = ["dep:metrics"]
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+[package]
+name = "sluiceway"
+version.workspace = true
+edition.workspace = true
+description = "Facade for the Sluiceway typed linear and fanout pipeline framework"
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+sluiceway-core.workspace = true
+sluiceway-io = { workspace = true, optional = true }
+
+[dev-dependencies]
+futures-core.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[features]
+default = []
+full = ["metrics", "object-store", "sql"]
+io = ["dep:sluiceway-io", "sluiceway-io/filesystem"]
+metrics = ["sluiceway-core/metrics"]
+object-store = ["io", "sluiceway-io/object-store"]
+sql = ["sql-mysql", "sql-postgres", "sql-sqlite"]
+sql-mysql = ["io", "sluiceway-io/sql-mysql"]
+sql-postgres = ["io", "sluiceway-io/sql-postgres"]
+sql-sqlite = ["io", "sluiceway-io/sql-sqlite"]
+
+[lints]
+workspace = true

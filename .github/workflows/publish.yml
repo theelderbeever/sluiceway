@@ -1,0 +1,83 @@
+name: Publish crates
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish ${{ github.event.release.tag_name }}
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: crates-io-${{ github.event.release.tag_name }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out released commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: 1.98.0
+
+      - name: Select and validate release
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "Release tag ${RELEASE_TAG} does not point to a commit on main" >&2
+            exit 1
+          fi
+
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          shared_version="$(jq -r '.packages[] | select(.name == "sluiceway") | .version' <<<"${metadata}")"
+          core_version="$(jq -r '.packages[] | select(.name == "sluiceway-core") | .version' <<<"${metadata}")"
+          io_version="$(jq -r '.packages[] | select(.name == "sluiceway-io") | .version' <<<"${metadata}")"
+          contrib_version="$(jq -r '.packages[] | select(.name == "sluiceway-contrib") | .version' <<<"${metadata}")"
+
+          if [[ "${shared_version}" != "${core_version}" || "${shared_version}" != "${io_version}" ]]; then
+            echo "sluiceway, sluiceway-core, and sluiceway-io must have the same version" >&2
+            exit 1
+          fi
+
+          case "${RELEASE_TAG}" in
+            "v${shared_version}")
+              echo "config=.github/release-plz/shared.toml" >>"${GITHUB_OUTPUT}"
+              ;;
+            "sluiceway-contrib-v${contrib_version}")
+              echo "config=.github/release-plz/contrib.toml" >>"${GITHUB_OUTPUT}"
+              ;;
+            *)
+              echo "Release tag ${RELEASE_TAG} does not match v${shared_version} or sluiceway-contrib-v${contrib_version}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+      - name: Validate package manifests
+        run: cargo package --workspace --locked --no-verify
+
+      - name: Publish crates
+        uses: release-plz/action@346832d73e3415c2ebd0432cba3a2bf5881e5f7d # v0.5.135
+        with:
+          command: release
+          config: ${{ steps.release.outputs.config }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

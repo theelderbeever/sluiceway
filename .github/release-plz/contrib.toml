@@ -1,0 +1,15 @@
+[workspace]
+git_release_enable = false
+git_tag_enable = false
+
+[[package]]
+name = "sluiceway"
+release = false
+
+[[package]]
+name = "sluiceway-core"
+release = false
+
+[[package]]
+name = "sluiceway-io"
+release = false
