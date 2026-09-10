@@ -65,8 +65,19 @@ mod implementation {
         metrics::counter!("penstock_records_total", "topology" => topology, "pipeline_id" => pipeline_id.as_str().to_owned()).increment(1);
     }
 
-    pub(crate) fn batch(topology: &'static str, pipeline_id: &PipelineId, records: usize) {
-        metrics::counter!("penstock_batches_total", "topology" => topology, "pipeline_id" => pipeline_id.as_str().to_owned()).increment(1);
+    pub(crate) fn batch(
+        topology: &'static str,
+        pipeline_id: &PipelineId,
+        records: usize,
+        reason: &'static str,
+    ) {
+        metrics::counter!(
+            "penstock_batches_total",
+            "topology" => topology,
+            "pipeline_id" => pipeline_id.as_str().to_owned(),
+            "reason" => reason
+        )
+        .increment(1);
         metrics::histogram!("penstock_batch_records", "topology" => topology, "pipeline_id" => pipeline_id.as_str().to_owned())
             .record(records as f64);
     }
@@ -129,7 +140,13 @@ mod implementation {
     }
 
     pub(crate) fn record(_topology: &'static str, _pipeline_id: &PipelineId) {}
-    pub(crate) fn batch(_topology: &'static str, _pipeline_id: &PipelineId, _records: usize) {}
+    pub(crate) fn batch(
+        _topology: &'static str,
+        _pipeline_id: &PipelineId,
+        _records: usize,
+        _reason: &'static str,
+    ) {
+    }
     pub(crate) fn sink_delivery(
         _topology: &'static str,
         _pipeline_id: &PipelineId,

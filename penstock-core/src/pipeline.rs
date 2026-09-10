@@ -44,6 +44,14 @@ impl BatchPolicy {
     pub fn timeout(self) -> Duration {
         self.timeout
     }
+
+    fn emit_reason(self, records: usize) -> &'static str {
+        if records == self.size.get() {
+            "full"
+        } else {
+            "timeout"
+        }
+    }
 }
 
 /// A source and its consuming transform, before delivery topology is selected.
@@ -267,7 +275,8 @@ where
             let Some(batch) = Batch::from_chunk(chunk, So::track)? else {
                 continue;
             };
-            telemetry::batch(TOPOLOGY, &pipeline_id, batch.len());
+            let reason = self.strategy.policy.emit_reason(batch.len());
+            telemetry::batch(TOPOLOGY, &pipeline_id, batch.len(), reason);
             let cursor = batch.cursor.clone();
 
             let delivery = {
@@ -414,7 +423,8 @@ where
             let Some(batch) = Batch::from_chunk(chunk, So::track)? else {
                 continue;
             };
-            telemetry::batch(TOPOLOGY, &pipeline_id, batch.len());
+            let reason = self.strategy.policy.emit_reason(batch.len());
+            telemetry::batch(TOPOLOGY, &pipeline_id, batch.len(), reason);
             let cursor = batch.cursor.clone();
             let mut tasks = JoinSet::new();
             let (last_sink, preceding_sinks) = self
@@ -516,7 +526,8 @@ where
             let Some(batch) = Batch::from_chunk(chunk, So::track)? else {
                 continue;
             };
-            telemetry::batch(TOPOLOGY, &pipeline_id, batch.len());
+            let reason = self.strategy.policy.emit_reason(batch.len());
+            telemetry::batch(TOPOLOGY, &pipeline_id, batch.len(), reason);
             let cursor = batch.cursor.clone();
             let batch: SharedBatch<Tr::Out, So::Cursor> = Arc::new(batch);
             let mut tasks = JoinSet::new();

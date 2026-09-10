@@ -123,7 +123,7 @@ Metric names and labels are intentionally bounded:
 | --- | --- | --- |
 | `penstock_pipeline_active` | gauge | `pipeline_id`, `topology` |
 | `penstock_records_total` | counter | `pipeline_id`, `topology` |
-| `penstock_batches_total` | counter | `pipeline_id`, `topology` |
+| `penstock_batches_total` | counter | `pipeline_id`, `topology`, `reason` |
 | `penstock_batch_records` | histogram | `pipeline_id`, `topology` |
 | `penstock_sink_deliveries_total` | counter | `pipeline_id`, `topology`, `status` |
 | `penstock_commits_total` | counter | `pipeline_id`, `topology`, `status` |
@@ -135,7 +135,8 @@ transforms, individual sink deliveries, and cursor commits. Metrics emission is 
 the feature is disabled, and the optional dependency is omitted. `penstock-core` users can enable
 its feature directly. Construct a stable `PipelineId` once and pass a clone to both `Pipeline::id`
 and `SqlCheckpoint::with_id` to correlate metrics with durable progress. Pipelines without a
-configured identity use the fixed `unnamed` label.
+configured identity use the fixed `unnamed` label. The batch `reason` is `full` or `timeout`;
+partial batches flushed when the source ends are included in `timeout`.
 `PipelineId` permits ASCII letters, digits, `-`, `_`, `.`, `:`, and `/`; this invariant is enforced
 when the value is constructed and does not need to be checked again by checkpoint or metrics code.
 
