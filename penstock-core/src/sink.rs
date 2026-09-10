@@ -2,58 +2,57 @@ use std::{future::Future, marker::PhantomData, ops::Deref, pin::Pin, sync::Arc};
 
 use crate::{ErasedError, Record};
 
-/// One owned batch of transformed items and its source-selected commit cursor.
+/// One owned batch of transformed records.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Batch<T, C> {
-    pub items: Vec<T>,
-    pub cursor: C,
+pub struct Batch<T, P> {
+    pub records: Vec<Record<T, P>>,
 }
 
-impl<T, C> Batch<T, C> {
-    pub fn new(items: Vec<T>, cursor: C) -> Self {
-        Self { items, cursor }
+impl<T, P> Batch<T, P> {
+    pub fn new(records: Vec<Record<T, P>>) -> Self {
+        Self { records }
     }
 
-    pub fn into_parts(self) -> (Vec<T>, C) {
-        (self.items, self.cursor)
+    pub fn into_records(self) -> Vec<Record<T, P>> {
+        self.records
     }
 
-    pub(crate) fn from_chunk<P, E>(
+    pub(crate) fn from_chunk<Cp, E>(
         chunk: Vec<Result<Record<T, P>, E>>,
-        mut track: impl FnMut(Option<C>, P) -> C,
-    ) -> Result<Option<Self>, E> {
-        let mut items = Vec::with_capacity(chunk.len());
-        let mut cursor = None;
+        mut track: impl FnMut(Option<Cp>, &P) -> Cp,
+    ) -> Result<Option<(Self, Cp)>, E> {
+        let mut records = Vec::with_capacity(chunk.len());
+        let mut checkpoint = None;
 
         for record in chunk {
-            let Record { position, payload } = record?;
-            cursor = Some(track(cursor, position));
-            items.push(payload);
+            let record = record?;
+            checkpoint = Some(track(checkpoint, record.position()));
+            records.push(record);
         }
 
-        Ok(cursor.map(|cursor| Self::new(items, cursor)))
+        Ok(checkpoint.map(|checkpoint| (Self::new(records), checkpoint)))
     }
 }
 
-impl<T, C> Deref for Batch<T, C> {
-    type Target = [T];
+impl<T, P> Deref for Batch<T, P> {
+    type Target = [Record<T, P>];
 
     fn deref(&self) -> &Self::Target {
-        &self.items
+        &self.records
     }
 }
 
-impl<T, C> IntoIterator for Batch<T, C> {
-    type Item = T;
-    type IntoIter = std::vec::IntoIter<T>;
+impl<T, P> IntoIterator for Batch<T, P> {
+    type Item = Record<T, P>;
+    type IntoIter = std::vec::IntoIter<Record<T, P>>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.items.into_iter()
+        self.records.into_iter()
     }
 }
 
 /// One immutable batch shared by every sink in shared fanout.
-pub type SharedBatch<T, C> = Arc<Batch<T, C>>;
+pub type SharedBatch<T, P> = Arc<Batch<T, P>>;
 
 /// Type-state marker selecting cloned fanout batches.
 #[derive(Debug, Default, Clone, Copy)]
@@ -65,24 +64,24 @@ pub struct Shared;
 
 /// Maps a fanout ownership mode to the input consumed by its sinks.
 #[doc(hidden)]
-pub trait FanoutMode<T, C> {
+pub trait FanoutMode<T, P> {
     type Input: Send + 'static;
 }
 
-impl<T, C> FanoutMode<T, C> for Cloned
+impl<T, P> FanoutMode<T, P> for Cloned
 where
     T: Send + 'static,
-    C: Send + 'static,
+    P: Send + 'static,
 {
-    type Input = Batch<T, C>;
+    type Input = Batch<T, P>;
 }
 
-impl<T, C> FanoutMode<T, C> for Shared
+impl<T, P> FanoutMode<T, P> for Shared
 where
     T: Send + Sync + 'static,
-    C: Send + Sync + 'static,
+    P: Send + Sync + 'static,
 {
-    type Input = SharedBatch<T, C>;
+    type Input = SharedBatch<T, P>;
 }
 
 /// Durably consumes an input.
@@ -109,33 +108,33 @@ where
 }
 
 /// A sink whose concrete type and error have been erased for fanout delivery.
-pub struct BoxSink<T, C, Mode = Shared>
+pub struct BoxSink<T, P, Mode = Shared>
 where
-    Mode: FanoutMode<T, C>,
+    Mode: FanoutMode<T, P>,
 {
     inner: Arc<dyn ErasedSink<Mode::Input>>,
     payload: PhantomData<fn() -> T>,
-    cursor: PhantomData<fn() -> C>,
+    position: PhantomData<fn() -> P>,
     mode: PhantomData<fn() -> Mode>,
 }
 
-impl<T, C, Mode> Clone for BoxSink<T, C, Mode>
+impl<T, P, Mode> Clone for BoxSink<T, P, Mode>
 where
-    Mode: FanoutMode<T, C>,
+    Mode: FanoutMode<T, P>,
 {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
             payload: PhantomData,
-            cursor: PhantomData,
+            position: PhantomData,
             mode: PhantomData,
         }
     }
 }
 
-impl<T, C, Mode> BoxSink<T, C, Mode>
+impl<T, P, Mode> BoxSink<T, P, Mode>
 where
-    Mode: FanoutMode<T, C>,
+    Mode: FanoutMode<T, P>,
 {
     pub fn new<S>(sink: S) -> Self
     where
@@ -144,7 +143,7 @@ where
         Self {
             inner: Arc::new(sink),
             payload: PhantomData,
-            cursor: PhantomData,
+            position: PhantomData,
             mode: PhantomData,
         }
     }
@@ -154,22 +153,22 @@ where
     }
 }
 
-impl<T, C, S> From<S> for BoxSink<T, C, Cloned>
+impl<T, P, S> From<S> for BoxSink<T, P, Cloned>
 where
     T: Send + 'static,
-    C: Send + 'static,
-    S: Sink<Batch<T, C>> + 'static,
+    P: Send + 'static,
+    S: Sink<Batch<T, P>> + 'static,
 {
     fn from(sink: S) -> Self {
         Self::new(sink)
     }
 }
 
-impl<T, C, S> From<S> for BoxSink<T, C, Shared>
+impl<T, P, S> From<S> for BoxSink<T, P, Shared>
 where
     T: Send + Sync + 'static,
-    C: Send + Sync + 'static,
-    S: Sink<SharedBatch<T, C>> + 'static,
+    P: Send + Sync + 'static,
+    S: Sink<SharedBatch<T, P>> + 'static,
 {
     fn from(sink: S) -> Self {
         Self::new(sink)

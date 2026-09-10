@@ -20,7 +20,7 @@ struct Numbers {
 impl Source for Numbers {
     type Payload = u64;
     type Position = u64;
-    type Cursor = u64;
+    type Checkpoint = u64;
     type Error = Infallible;
 
     fn stream(
@@ -30,12 +30,12 @@ impl Source for Numbers {
         stream::iter((0..self.end).map(|number| Ok(Record::new(number, number))))
     }
 
-    fn track(_cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
-        position
+    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
+        *position
     }
 
-    async fn commit(&self, cursor: Self::Cursor) -> Result<(), Self::Error> {
-        println!("committed through source position {cursor}");
+    async fn commit(&self, checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
+        println!("committed through source position {checkpoint}");
         Ok(())
     }
 }
@@ -47,7 +47,9 @@ impl Sink<SharedBatch<u64, u64>> for PrintBatch {
 
     async fn deliver(&self, batch: SharedBatch<u64, u64>) -> Result<(), Self::Error> {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        println!("cursor {}: {:?}", batch.cursor, batch.items);
+        for record in batch.iter() {
+            println!("position {}: {}", record.position(), record.payload);
+        }
         Ok(())
     }
 }
@@ -70,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let count = Arc::new(AtomicUsize::new(0));
 
     Pipeline::source(Numbers { end: 5 })
-        .transform(|number| async move { Ok::<_, Infallible>(number * number) })
+        .transform(|_position: &u64, number| async move { Ok::<_, Infallible>(number * number) })
         .fanout()
         .shared()
         .sinks([

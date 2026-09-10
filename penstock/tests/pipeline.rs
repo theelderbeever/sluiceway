@@ -41,7 +41,7 @@ struct Numbers {
 impl Source for Numbers {
     type Payload = u64;
     type Position = Cursor;
-    type Cursor = Cursor;
+    type Checkpoint = Cursor;
     type Error = Infallible;
 
     fn stream(
@@ -57,12 +57,12 @@ impl Source for Numbers {
         )
     }
 
-    fn track(_cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
-        position
+    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
+        position.clone()
     }
 
-    async fn commit(&self, cursor: Self::Cursor) -> Result<(), Self::Error> {
-        self.committed.lock().unwrap().push(cursor);
+    async fn commit(&self, checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
+        self.committed.lock().unwrap().push(checkpoint);
         Ok(())
     }
 }
@@ -99,7 +99,10 @@ impl<T: Send> Sink<Batch<T, Cursor>> for LinearCollector<T> {
     type Error = TestSinkError;
 
     async fn deliver(&self, batch: Batch<T, Cursor>) -> Result<(), Self::Error> {
-        self.records.lock().unwrap().extend(batch);
+        self.records
+            .lock()
+            .unwrap()
+            .extend(batch.into_iter().map(|record| record.payload));
         acknowledge(self.ack)
     }
 }
@@ -182,7 +185,9 @@ async fn linear_pipeline_moves_owned_transformed_batches_to_one_sink() {
 
     Pipeline::source(source)
         .id(PipelineId::new("linear-test").unwrap())
-        .transform(|number: u64| async move { Ok::<_, Infallible>(number.to_string()) })
+        .transform(|_position: &Cursor, number: u64| async move {
+            Ok::<_, Infallible>(number.to_string())
+        })
         .sink(sink)
         .batched(BatchPolicy::try_new(2, Duration::from_secs(1)).unwrap())
         .run()
@@ -205,6 +210,25 @@ async fn linear_pipeline_moves_owned_transformed_batches_to_one_sink() {
 }
 
 #[tokio::test]
+async fn transform_can_use_the_position_retained_for_delivery() {
+    let (source, _) = source(vec![40, 40]);
+    let (sink, records) = linear_collector(Ack::Exact);
+
+    Pipeline::source(source)
+        .transform(|position: &Cursor, number| {
+            let offset = position.offset;
+            async move { Ok::<_, Infallible>(number + offset) }
+        })
+        .sink(sink)
+        .batched(BatchPolicy::try_new(2, Duration::from_secs(1)).unwrap())
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(*records.lock().unwrap(), vec![40, 41]);
+}
+
+#[tokio::test]
 async fn cloned_fanout_reuses_owned_sinks() {
     let (source, committed) = source(vec![2, 30, 400]);
     let (collector, records) = linear_collector(Ack::Exact);
@@ -214,7 +238,9 @@ async fn cloned_fanout_reuses_owned_sinks() {
     };
 
     Pipeline::source(source)
-        .transform(|number: u64| async move { Ok::<_, Infallible>(number.to_string()) })
+        .transform(|_position: &Cursor, number: u64| async move {
+            Ok::<_, Infallible>(number.to_string())
+        })
         .fanout()
         .cloned()
         .sinks([collector.into(), counter.into()])
@@ -238,7 +264,9 @@ async fn cloned_fanout_does_not_require_sync_payloads() {
     let (second, second_records) = linear_collector(Ack::Exact);
 
     Pipeline::source(source)
-        .transform(|number| async move { Ok::<_, Infallible>(Cell::new(number)) })
+        .transform(
+            |_position: &Cursor, number| async move { Ok::<_, Infallible>(Cell::new(number)) },
+        )
         .fanout()
         .cloned()
         .sinks([first.into(), second.into()])
@@ -260,7 +288,9 @@ async fn shared_fanout_does_not_require_clone_payloads() {
     let (second, second_batches) = shared_collector(Ack::Exact);
 
     Pipeline::source(source)
-        .transform(|number| async move { Ok::<_, Infallible>(NonClone(number)) })
+        .transform(
+            |_position: &Cursor, number| async move { Ok::<_, Infallible>(NonClone(number)) },
+        )
         .fanout()
         .shared()
         .sinks([first.into(), second.into()])
@@ -269,8 +299,8 @@ async fn shared_fanout_does_not_require_clone_payloads() {
         .await
         .unwrap();
 
-    assert_eq!(first_batches.lock().unwrap()[0][0].0, 7);
-    assert_eq!(second_batches.lock().unwrap()[0][0].0, 7);
+    assert_eq!(first_batches.lock().unwrap()[0][0].payload.0, 7);
+    assert_eq!(second_batches.lock().unwrap()[0][0].payload.0, 7);
 }
 
 #[tokio::test]
@@ -279,7 +309,7 @@ async fn fanout_accepts_heterogeneous_array_and_shares_whole_batches() {
     let transform_calls = Arc::new(AtomicUsize::new(0));
     let transform = {
         let calls = Arc::clone(&transform_calls);
-        move |number: u64| {
+        move |_position: &Cursor, number: u64| {
             calls.fetch_add(1, Ordering::SeqCst);
             async move { Ok::<_, Infallible>(number.to_string()) }
         }
@@ -311,8 +341,8 @@ async fn fanout_accepts_heterogeneous_array_and_shares_whole_batches() {
     let second = second_batches.lock().unwrap();
     assert_eq!(first.len(), 2);
     assert_eq!(second.len(), 2);
-    assert_eq!(first[0].cursor, Cursor::at(1));
-    assert_eq!(first[1].cursor, Cursor::at(2));
+    assert_eq!(first[0].last().unwrap().position(), &Cursor::at(1));
+    assert_eq!(first[1].last().unwrap().position(), &Cursor::at(2));
     assert!(Arc::ptr_eq(&first[0], &second[0]));
     assert!(Arc::ptr_eq(&first[1], &second[1]));
 }
@@ -349,7 +379,7 @@ struct StartedSource {
 impl Source for StartedSource {
     type Payload = u64;
     type Position = Cursor;
-    type Cursor = Cursor;
+    type Checkpoint = Cursor;
     type Error = Infallible;
 
     fn stream(
@@ -360,11 +390,11 @@ impl Source for StartedSource {
         stream::empty()
     }
 
-    fn track(_cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
-        position
+    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
+        position.clone()
     }
 
-    async fn commit(&self, _cursor: Self::Cursor) -> Result<(), Self::Error> {
+    async fn commit(&self, _checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -525,7 +555,7 @@ async fn sink_failure_prevents_commit() {
 }
 
 #[tokio::test]
-async fn no_checkpoint_is_generic_over_cursor_type() {
+async fn no_checkpoint_store_accepts_a_custom_checkpoint_type() {
     let store = Some(NoCheckpoint);
     assert_eq!(
         <Option<NoCheckpoint> as CheckpointStore<Cursor>>::load(&store)
@@ -562,7 +592,7 @@ struct FallibleSource {
 impl Source for FallibleSource {
     type Payload = u64;
     type Position = Cursor;
-    type Cursor = Cursor;
+    type Checkpoint = Cursor;
     type Error = SourceFailure;
 
     fn stream(
@@ -576,11 +606,11 @@ impl Source for FallibleSource {
         })
     }
 
-    fn track(_cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
-        position
+    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
+        position.clone()
     }
 
-    async fn commit(&self, _cursor: Self::Cursor) -> Result<(), Self::Error> {
+    async fn commit(&self, _checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
         self.committed.store(true, Ordering::SeqCst);
         Err(SourceFailure)
     }
@@ -608,7 +638,7 @@ async fn source_transform_and_commit_errors_retain_their_stage() {
     let (source, _) = source(vec![1]);
     let (sink, _) = linear_collector::<u64>(Ack::Exact);
     let transform_result = Pipeline::source(source)
-        .transform(|_: u64| async move { Err::<u64, _>(TransformFailure) })
+        .transform(|_position: &Cursor, _: u64| async move { Err::<u64, _>(TransformFailure) })
         .sink(sink)
         .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
         .run_until(std::future::pending())
@@ -641,7 +671,7 @@ struct DelayedSource {
 impl Source for DelayedSource {
     type Payload = u64;
     type Position = Cursor;
-    type Cursor = Cursor;
+    type Checkpoint = Cursor;
     type Error = Infallible;
 
     fn stream(
@@ -656,12 +686,12 @@ impl Source for DelayedSource {
         })
     }
 
-    fn track(_cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
-        position
+    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
+        position.clone()
     }
 
-    async fn commit(&self, cursor: Self::Cursor) -> Result<(), Self::Error> {
-        self.committed.lock().unwrap().push(cursor);
+    async fn commit(&self, checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
+        self.committed.lock().unwrap().push(checkpoint);
         Ok(())
     }
 }
@@ -691,7 +721,7 @@ async fn timeout_and_end_of_stream_flush_partial_batches() {
 #[tokio::test]
 async fn concurrent_transforms_retain_source_order() {
     let (source, _) = source(vec![0, 1, 2]);
-    let transform = Transformer::new(|number: u64| async move {
+    let transform = Transformer::new(|_position: &Cursor, number: u64| async move {
         tokio::time::sleep(Duration::from_millis((3 - number) * 5)).await;
         Ok::<_, Infallible>(number)
     })
@@ -717,7 +747,7 @@ struct GracefulSource {
 impl Source for GracefulSource {
     type Payload = u64;
     type Position = Cursor;
-    type Cursor = Cursor;
+    type Checkpoint = Cursor;
     type Error = tokio::sync::oneshot::error::RecvError;
 
     fn stream(
@@ -740,12 +770,12 @@ impl Source for GracefulSource {
         ]))
     }
 
-    fn track(_cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
-        position
+    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
+        position.clone()
     }
 
-    async fn commit(&self, cursor: Self::Cursor) -> Result<(), Self::Error> {
-        self.committed.lock().unwrap().push(cursor);
+    async fn commit(&self, checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
+        self.committed.lock().unwrap().push(checkpoint);
         Ok(())
     }
 }
@@ -800,7 +830,7 @@ struct OpenSource {
 impl Source for OpenSource {
     type Payload = u64;
     type Position = Cursor;
-    type Cursor = Cursor;
+    type Checkpoint = Cursor;
     type Error = Infallible;
 
     fn stream(
@@ -810,12 +840,12 @@ impl Source for OpenSource {
         stream::once(async { Ok(Record::new(Cursor::at(0), 1)) }).chain(stream::pending())
     }
 
-    fn track(_cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
-        position
+    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
+        position.clone()
     }
 
-    async fn commit(&self, cursor: Self::Cursor) -> Result<(), Self::Error> {
-        self.committed.lock().unwrap().push(cursor);
+    async fn commit(&self, checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
+        self.committed.lock().unwrap().push(checkpoint);
         Ok(())
     }
 }
@@ -830,7 +860,7 @@ async fn shutdown_drains_admitted_transform_and_flushes_its_batch() {
     let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
     let transform = {
         let shutdown_tx = Arc::clone(&shutdown_tx);
-        move |value: u64| {
+        move |_position: &Cursor, value: u64| {
             shutdown_tx
                 .lock()
                 .unwrap()
@@ -858,14 +888,14 @@ async fn shutdown_drains_admitted_transform_and_flushes_its_batch() {
 }
 
 struct PositionedSource {
-    cursors: Vec<Cursor>,
+    positions: Vec<Cursor>,
     committed: Arc<Mutex<Vec<Cursor>>>,
 }
 
 impl Source for PositionedSource {
     type Payload = ();
     type Position = Cursor;
-    type Cursor = Cursor;
+    type Checkpoint = Cursor;
     type Error = Infallible;
 
     fn stream(
@@ -873,28 +903,28 @@ impl Source for PositionedSource {
     ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_
     {
         stream::iter(
-            self.cursors
+            self.positions
                 .clone()
                 .into_iter()
-                .map(|cursor| Ok(Record::new(cursor, ()))),
+                .map(|position| Ok(Record::new(position, ()))),
         )
     }
 
-    fn track(_cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
-        position
+    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
+        position.clone()
     }
 
-    async fn commit(&self, cursor: Self::Cursor) -> Result<(), Self::Error> {
-        self.committed.lock().unwrap().push(cursor);
+    async fn commit(&self, checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
+        self.committed.lock().unwrap().push(checkpoint);
         Ok(())
     }
 }
 
 #[tokio::test]
-async fn repeated_and_non_monotonic_cursors_remain_opaque() {
+async fn repeated_and_non_monotonic_checkpoints_remain_opaque() {
     let committed = Arc::new(Mutex::new(Vec::new()));
     let source = PositionedSource {
-        cursors: vec![Cursor::at(4), Cursor::at(4), Cursor::at(2)],
+        positions: vec![Cursor::at(4), Cursor::at(4), Cursor::at(2)],
         committed: Arc::clone(&committed),
     };
     let (sink, _) = linear_collector(Ack::Exact);

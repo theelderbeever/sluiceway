@@ -1,25 +1,19 @@
 use std::{convert::Infallible, future::Future, num::NonZeroUsize};
 
-use thiserror::Error;
-
-/// A failure returned by a transform dispatched to a Tokio task.
-#[derive(Debug, Error)]
-pub enum SpawnError<E>
-where
-    E: std::error::Error + 'static,
-{
-    #[error(transparent)]
-    Transform(E),
-    #[error("transform task failed")]
-    Task(#[source] tokio::task::JoinError),
-}
-
-/// Converts one typed value into another.
-pub trait Transform<In: Send>: Send + Sync {
+/// Converts one typed value into another with read-only access to its source position.
+///
+/// The runner retains the owned position and attaches it to the transformed output. A transform
+/// that dispatches work to a `'static` Tokio task must copy or clone any position data needed by
+/// that task before spawning it.
+pub trait Transform<In: Send, P: Sync>: Send + Sync {
     type Out: Send;
     type Error: std::error::Error + Send + Sync + 'static;
 
-    fn apply(&self, input: In) -> impl Future<Output = Result<Self::Out, Self::Error>> + Send;
+    fn apply(
+        &self,
+        position: &P,
+        input: In,
+    ) -> impl Future<Output = Result<Self::Out, Self::Error>> + Send;
 
     /// Maximum number of inputs the runner may transform concurrently while retaining order.
     fn max_concurrency(&self) -> NonZeroUsize {
@@ -27,19 +21,20 @@ pub trait Transform<In: Send>: Send + Sync {
     }
 }
 
-impl<In, Out, E, F, Fut> Transform<In> for F
+impl<In, P, Out, E, F, Fut> Transform<In, P> for F
 where
     In: Send,
+    P: Sync,
     Out: Send,
     E: std::error::Error + Send + Sync + 'static,
-    F: Fn(In) -> Fut + Send + Sync,
+    F: Fn(&P, In) -> Fut + Send + Sync,
     Fut: Future<Output = Result<Out, E>> + Send,
 {
     type Out = Out;
     type Error = E;
 
-    fn apply(&self, input: In) -> impl Future<Output = Result<Out, E>> + Send {
-        self(input)
+    fn apply(&self, position: &P, input: In) -> impl Future<Output = Result<Out, E>> + Send {
+        self(position, input)
     }
 }
 
@@ -64,44 +59,21 @@ impl<T> Transformer<T> {
     }
 }
 
-impl Transformer<()> {
-    /// Runs each asynchronous transform in its own Tokio task.
-    ///
-    /// Transform failures and task cancellation or panic are returned as [`SpawnError`].
-    pub fn spawn<In, Out, E, F, Fut>(
-        concurrency: NonZeroUsize,
-        transform: F,
-    ) -> Transformer<impl Transform<In, Out = Out, Error = SpawnError<E>>>
-    where
-        In: Send + 'static,
-        Out: Send + 'static,
-        E: std::error::Error + Send + Sync + 'static,
-        F: Fn(In) -> Fut + Send + Sync,
-        Fut: Future<Output = Result<Out, E>> + Send + 'static,
-    {
-        Transformer::new(move |input| {
-            let future = transform(input);
-            async move {
-                tokio::spawn(future)
-                    .await
-                    .map_err(SpawnError::Task)?
-                    .map_err(SpawnError::Transform)
-            }
-        })
-        .concurrency(concurrency)
-    }
-}
-
-impl<In, T> Transform<In> for Transformer<T>
+impl<In, P, T> Transform<In, P> for Transformer<T>
 where
     In: Send,
-    T: Transform<In>,
+    P: Sync,
+    T: Transform<In, P>,
 {
     type Out = T::Out;
     type Error = T::Error;
 
-    fn apply(&self, input: In) -> impl Future<Output = Result<Self::Out, Self::Error>> + Send {
-        self.inner.apply(input)
+    fn apply(
+        &self,
+        position: &P,
+        input: In,
+    ) -> impl Future<Output = Result<Self::Out, Self::Error>> + Send {
+        self.inner.apply(position, input)
     }
 
     fn max_concurrency(&self) -> NonZeroUsize {
@@ -113,85 +85,86 @@ where
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Identity;
 
-impl<In: Send> Transform<In> for Identity {
+impl<In: Send, P: Sync> Transform<In, P> for Identity {
     type Out = In;
     type Error = Infallible;
 
-    async fn apply(&self, input: In) -> Result<In, Self::Error> {
+    async fn apply(&self, _position: &P, input: In) -> Result<In, Self::Error> {
         Ok(input)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        convert::Infallible,
-        io,
-        num::NonZeroUsize,
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
-    };
+    use std::{convert::Infallible, num::NonZeroUsize};
 
-    use super::{SpawnError, Transform, Transformer};
+    use super::{Transform, Transformer};
 
     #[tokio::test]
-    async fn spawn_runs_an_async_transform_in_a_task() {
+    async fn transformer_controls_ordered_concurrency() {
         let concurrency = NonZeroUsize::new(2).unwrap();
-        let transform = Transformer::spawn(concurrency, |input| async move {
-            Ok::<_, Infallible>((input * 2, tokio::task::id()))
-        });
+        let transform =
+            Transformer::new(
+                |_position: &u64, input| async move { Ok::<_, Infallible>(input * 2) },
+            )
+            .concurrency(concurrency);
 
-        let (output, _) = transform.apply(21).await.unwrap();
+        let output = transform.apply(&7, 21).await.unwrap();
 
         assert_eq!(output, 42);
         assert_eq!(transform.max_concurrency(), concurrency);
     }
 
     #[tokio::test]
-    async fn spawn_returns_task_panics_as_join_errors() {
-        let transform = Transformer::spawn(NonZeroUsize::MIN, |()| async move {
-            panic!("transform panicked");
-            #[allow(unreachable_code)]
-            Ok::<(), Infallible>(())
-        });
-
-        assert!(matches!(
-            transform.apply(()).await.unwrap_err(),
-            SpawnError::Task(error) if error.is_panic()
-        ));
-    }
-
-    #[tokio::test]
-    async fn spawn_preserves_transform_errors() {
-        let transform = Transformer::spawn(NonZeroUsize::MIN, |()| async move {
-            Err::<(), _>(io::Error::other("transform failed"))
-        });
-
-        assert!(matches!(
-            transform.apply(()).await.unwrap_err(),
-            SpawnError::Transform(error) if error.to_string() == "transform failed"
-        ));
-    }
-
-    #[tokio::test]
-    async fn spawn_waits_until_the_apply_future_is_polled() {
-        let async_started = Arc::new(AtomicBool::new(false));
-        let transform = Transformer::spawn(NonZeroUsize::MIN, {
-            let async_started = Arc::clone(&async_started);
-            move |()| {
-                let async_started = Arc::clone(&async_started);
-                async move {
-                    async_started.store(true, Ordering::SeqCst);
-                    Ok::<(), Infallible>(())
-                }
+    async fn transform_can_spawn_after_copying_position_data() {
+        let transform = |position: &u64, input| {
+            let position = *position;
+            async move {
+                tokio::spawn(async move { Ok::<_, Infallible>(position + input) })
+                    .await
+                    .unwrap()
             }
-        });
-        let future = transform.apply(());
+        };
 
-        tokio::task::yield_now().await;
-        assert!(!async_started.load(Ordering::SeqCst));
-        future.await.unwrap();
+        assert_eq!(transform.apply(&20, 22).await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn transform_can_spawn_blocking_after_copying_position_data() {
+        let transform = |position: &u64, input| {
+            let position = *position;
+            async move {
+                tokio::task::spawn_blocking(move || Ok::<_, Infallible>(position + input))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        assert_eq!(transform.apply(&20, 22).await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn transform_future_can_borrow_its_transform() {
+        struct Add(u64);
+
+        impl Transform<u64, u64> for Add {
+            type Out = u64;
+            type Error = Infallible;
+
+            async fn apply(&self, position: &u64, input: u64) -> Result<u64, Self::Error> {
+                tokio::task::yield_now().await;
+                Ok(self.0 + position + input)
+            }
+        }
+
+        let transform = Add(2);
+        assert_eq!(transform.apply(&19, 21).await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn identity_ignores_position() {
+        let transform = super::Identity;
+
+        assert_eq!(transform.apply(&"position", 42).await.unwrap(), 42);
     }
 }

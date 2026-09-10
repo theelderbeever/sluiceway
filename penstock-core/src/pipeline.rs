@@ -72,7 +72,7 @@ impl<So: Source> Pipeline<So> {
 
     pub fn transform<Tr>(self, transform: Tr) -> Pipeline<So, Tr>
     where
-        Tr: Transform<So::Payload>,
+        Tr: Transform<So::Payload, So::Position>,
     {
         Pipeline {
             id: self.id,
@@ -93,7 +93,7 @@ impl<So, Tr> Pipeline<So, Tr> {
 impl<So, Tr> Pipeline<So, Tr>
 where
     So: Source,
-    Tr: Transform<So::Payload>,
+    Tr: Transform<So::Payload, So::Position>,
 {
     /// Select linear delivery. Transformed values remain owned and are consumed by one sink.
     pub fn sink<Si>(self, sink: Si) -> LinearPipeline<So, Tr, Si> {
@@ -128,7 +128,7 @@ pub struct FanoutBuilder<So, Tr, Mode = Unset> {
 impl<So, Tr> FanoutBuilder<So, Tr>
 where
     So: Source,
-    Tr: Transform<So::Payload>,
+    Tr: Transform<So::Payload, So::Position>,
 {
     /// Give every sink its own owned clone of each batch.
     pub fn cloned(self) -> FanoutBuilder<So, Tr, Cloned> {
@@ -154,12 +154,12 @@ where
 impl<So, Tr> FanoutBuilder<So, Tr, Cloned>
 where
     So: Source,
-    Tr: Transform<So::Payload>,
+    Tr: Transform<So::Payload, So::Position>,
     Tr::Out: Send + 'static,
 {
     pub fn sinks<I>(self, sinks: I) -> FanoutPipeline<So, Tr, Cloned>
     where
-        I: IntoIterator<Item = BoxSink<Tr::Out, So::Cursor, Cloned>>,
+        I: IntoIterator<Item = BoxSink<Tr::Out, So::Position, Cloned>>,
     {
         FanoutPipeline {
             id: self.id,
@@ -174,12 +174,12 @@ where
 impl<So, Tr> FanoutBuilder<So, Tr, Shared>
 where
     So: Source,
-    Tr: Transform<So::Payload>,
+    Tr: Transform<So::Payload, So::Position>,
     Tr::Out: Send + Sync + 'static,
 {
     pub fn sinks<I>(self, sinks: I) -> FanoutPipeline<So, Tr, Shared>
     where
-        I: IntoIterator<Item = BoxSink<Tr::Out, So::Cursor, Shared>>,
+        I: IntoIterator<Item = BoxSink<Tr::Out, So::Position, Shared>>,
     {
         FanoutPipeline {
             id: self.id,
@@ -203,7 +203,7 @@ pub struct LinearPipeline<So, Tr, Si, St = Unset> {
 impl<So, Tr, Si> LinearPipeline<So, Tr, Si>
 where
     So: Source,
-    Tr: Transform<So::Payload>,
+    Tr: Transform<So::Payload, So::Position>,
 {
     pub fn batched(self, policy: BatchPolicy) -> LinearPipeline<So, Tr, Si, Batched> {
         LinearPipeline {
@@ -219,8 +219,8 @@ where
 impl<So, Tr, Si> LinearPipeline<So, Tr, Si, Batched>
 where
     So: Source,
-    Tr: Transform<So::Payload>,
-    Si: Sink<Batch<Tr::Out, So::Cursor>>,
+    Tr: Transform<So::Payload, So::Position>,
+    Si: Sink<Batch<Tr::Out, So::Position>>,
 {
     /// Run until the source stream reaches its natural end.
     ///
@@ -249,12 +249,14 @@ where
             .map(|item| {
                 let pipeline_id = pipeline_id.clone();
                 async move {
-                    let Record { position, payload } = item.map_err(|error| {
-                        telemetry::error(TOPOLOGY, &pipeline_id, "source");
-                        PipelineError::Source(error)
-                    })?;
+                    let (position, payload) = item
+                        .map_err(|error| {
+                            telemetry::error(TOPOLOGY, &pipeline_id, "source");
+                            PipelineError::Source(error)
+                        })?
+                        .into_parts();
                     let _timer = telemetry::StageTimer::new(TOPOLOGY, "transform", &pipeline_id);
-                    let payload = transform.apply(payload).await.map_err(|error| {
+                    let payload = transform.apply(&position, payload).await.map_err(|error| {
                         telemetry::error(TOPOLOGY, &pipeline_id, "transform");
                         PipelineError::Transform(error)
                     })?;
@@ -272,12 +274,11 @@ where
         tokio::pin!(chunks);
 
         while let Some(chunk) = chunks.next().await {
-            let Some(batch) = Batch::from_chunk(chunk, So::track)? else {
+            let Some((batch, checkpoint)) = Batch::from_chunk(chunk, So::track)? else {
                 continue;
             };
             let reason = self.strategy.policy.emit_reason(batch.len());
             telemetry::batch(TOPOLOGY, &pipeline_id, batch.len(), reason);
-            let cursor = batch.cursor.clone();
 
             let delivery = {
                 let _timer = telemetry::StageTimer::new(TOPOLOGY, "sink", &pipeline_id);
@@ -291,7 +292,7 @@ where
 
             let commit = {
                 let _timer = telemetry::StageTimer::new(TOPOLOGY, "commit", &pipeline_id);
-                self.source.commit(cursor).await
+                self.source.commit(checkpoint).await
             };
             telemetry::commit(TOPOLOGY, &pipeline_id, commit.is_ok());
             commit.map_err(|error| {
@@ -307,21 +308,21 @@ where
 pub struct FanoutPipeline<So, Tr, Mode, St = Unset>
 where
     So: Source,
-    Tr: Transform<So::Payload>,
-    Mode: FanoutMode<Tr::Out, So::Cursor>,
+    Tr: Transform<So::Payload, So::Position>,
+    Mode: FanoutMode<Tr::Out, So::Position>,
 {
     id: Option<PipelineId>,
     source: So,
     transform: Tr,
-    sinks: Vec<BoxSink<Tr::Out, So::Cursor, Mode>>,
+    sinks: Vec<BoxSink<Tr::Out, So::Position, Mode>>,
     strategy: St,
 }
 
 impl<So, Tr, Mode, St> FanoutPipeline<So, Tr, Mode, St>
 where
     So: Source,
-    Tr: Transform<So::Payload>,
-    Mode: FanoutMode<Tr::Out, So::Cursor>,
+    Tr: Transform<So::Payload, So::Position>,
+    Mode: FanoutMode<Tr::Out, So::Position>,
 {
     async fn drain(
         tasks: &mut JoinSet<Result<(), ErasedError>>,
@@ -351,8 +352,8 @@ where
 impl<So, Tr, Mode> FanoutPipeline<So, Tr, Mode>
 where
     So: Source,
-    Tr: Transform<So::Payload>,
-    Mode: FanoutMode<Tr::Out, So::Cursor>,
+    Tr: Transform<So::Payload, So::Position>,
+    Mode: FanoutMode<Tr::Out, So::Position>,
 {
     pub fn batched(self, policy: BatchPolicy) -> FanoutPipeline<So, Tr, Mode, Batched> {
         FanoutPipeline {
@@ -368,8 +369,9 @@ where
 impl<So, Tr> FanoutPipeline<So, Tr, Cloned, Batched>
 where
     So: Source,
-    Tr: Transform<So::Payload>,
+    Tr: Transform<So::Payload, So::Position>,
     Tr::Out: Clone + Send + 'static,
+    So::Position: Clone,
 {
     /// Run until the source stream reaches its natural end.
     pub async fn run(self) -> Result<(), PipelineError<So::Error, Tr::Error, ErasedError>> {
@@ -397,12 +399,14 @@ where
             .map(|item| {
                 let pipeline_id = pipeline_id.clone();
                 async move {
-                    let Record { position, payload } = item.map_err(|error| {
-                        telemetry::error(TOPOLOGY, &pipeline_id, "source");
-                        PipelineError::Source(error)
-                    })?;
+                    let (position, payload) = item
+                        .map_err(|error| {
+                            telemetry::error(TOPOLOGY, &pipeline_id, "source");
+                            PipelineError::Source(error)
+                        })?
+                        .into_parts();
                     let _timer = telemetry::StageTimer::new(TOPOLOGY, "transform", &pipeline_id);
-                    let payload = transform.apply(payload).await.map_err(|error| {
+                    let payload = transform.apply(&position, payload).await.map_err(|error| {
                         telemetry::error(TOPOLOGY, &pipeline_id, "transform");
                         PipelineError::Transform(error)
                     })?;
@@ -420,12 +424,11 @@ where
         tokio::pin!(chunks);
 
         while let Some(chunk) = chunks.next().await {
-            let Some(batch) = Batch::from_chunk(chunk, So::track)? else {
+            let Some((batch, checkpoint)) = Batch::from_chunk(chunk, So::track)? else {
                 continue;
             };
             let reason = self.strategy.policy.emit_reason(batch.len());
             telemetry::batch(TOPOLOGY, &pipeline_id, batch.len(), reason);
-            let cursor = batch.cursor.clone();
             let mut tasks = JoinSet::new();
             let (last_sink, preceding_sinks) =
                 self.sinks.split_last().ok_or(PipelineError::NoSinks)?;
@@ -454,7 +457,7 @@ where
 
             let commit = {
                 let _timer = telemetry::StageTimer::new(TOPOLOGY, "commit", &pipeline_id);
-                self.source.commit(cursor).await
+                self.source.commit(checkpoint).await
             };
             telemetry::commit(TOPOLOGY, &pipeline_id, commit.is_ok());
             commit.map_err(|error| {
@@ -469,7 +472,7 @@ where
 impl<So, Tr> FanoutPipeline<So, Tr, Shared, Batched>
 where
     So: Source,
-    Tr: Transform<So::Payload>,
+    Tr: Transform<So::Payload, So::Position>,
     Tr::Out: Send + Sync + 'static,
 {
     /// Run until the source stream reaches its natural end.
@@ -498,12 +501,14 @@ where
             .map(|item| {
                 let pipeline_id = pipeline_id.clone();
                 async move {
-                    let Record { position, payload } = item.map_err(|error| {
-                        telemetry::error(TOPOLOGY, &pipeline_id, "source");
-                        PipelineError::Source(error)
-                    })?;
+                    let (position, payload) = item
+                        .map_err(|error| {
+                            telemetry::error(TOPOLOGY, &pipeline_id, "source");
+                            PipelineError::Source(error)
+                        })?
+                        .into_parts();
                     let _timer = telemetry::StageTimer::new(TOPOLOGY, "transform", &pipeline_id);
-                    let payload = transform.apply(payload).await.map_err(|error| {
+                    let payload = transform.apply(&position, payload).await.map_err(|error| {
                         telemetry::error(TOPOLOGY, &pipeline_id, "transform");
                         PipelineError::Transform(error)
                     })?;
@@ -521,13 +526,12 @@ where
         tokio::pin!(chunks);
 
         while let Some(chunk) = chunks.next().await {
-            let Some(batch) = Batch::from_chunk(chunk, So::track)? else {
+            let Some((batch, checkpoint)) = Batch::from_chunk(chunk, So::track)? else {
                 continue;
             };
             let reason = self.strategy.policy.emit_reason(batch.len());
             telemetry::batch(TOPOLOGY, &pipeline_id, batch.len(), reason);
-            let cursor = batch.cursor.clone();
-            let batch: SharedBatch<Tr::Out, So::Cursor> = Arc::new(batch);
+            let batch: SharedBatch<Tr::Out, So::Position> = Arc::new(batch);
             let mut tasks = JoinSet::new();
 
             for sink in &self.sinks {
@@ -548,7 +552,7 @@ where
 
             let commit = {
                 let _timer = telemetry::StageTimer::new(TOPOLOGY, "commit", &pipeline_id);
-                self.source.commit(cursor).await
+                self.source.commit(checkpoint).await
             };
             telemetry::commit(TOPOLOGY, &pipeline_id, commit.is_ok());
             commit.map_err(|error| {

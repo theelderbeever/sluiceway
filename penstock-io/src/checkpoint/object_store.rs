@@ -43,24 +43,24 @@ impl ObjectStoreCheckpoint {
     }
 }
 
-impl<C> CheckpointStore<C> for ObjectStoreCheckpoint
+impl<Cp> CheckpointStore<Cp> for ObjectStoreCheckpoint
 where
-    C: DeserializeOwned + Serialize + Sync,
+    Cp: DeserializeOwned + Serialize + Sync,
 {
     type Error = ObjectStoreCheckpointError;
 
-    async fn load(&self) -> Result<Option<C>, Self::Error> {
+    async fn load(&self) -> Result<Option<Cp>, Self::Error> {
         let bytes = match self.store.get(&self.path).await {
             Ok(result) => result.bytes().await?,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let stored: StoredCheckpoint<C> = serde_json::from_slice(&bytes)?;
+        let stored: StoredCheckpoint<Cp> = serde_json::from_slice(&bytes)?;
         Ok(Some(stored.cursor))
     }
 
-    async fn save(&self, cursor: &C) -> Result<(), Self::Error> {
-        let body = serde_json::to_vec(&StoredCheckpoint { cursor })?;
+    async fn save(&self, checkpoint: &Cp) -> Result<(), Self::Error> {
+        let body = serde_json::to_vec(&StoredCheckpoint { cursor: checkpoint })?;
         self.store.put(&self.path, PutPayload::from(body)).await?;
         Ok(())
     }

@@ -1,378 +1,492 @@
 //! Kafka-compatible sources, including Redpanda and Redpanda Cloud.
 //!
-//! Both source modes preserve the message's Kafka metadata. Raw mode owns optional payload bytes,
-//! including tombstones, while JSON mode strictly decodes a present payload into a known type:
+//! User-provided key and payload deserializers run inline against librdkafka's borrowed byte
+//! slices. Missing keys and payloads remain `None`; present values carry either their decoded
+//! value or their deserialization error. The resulting record is owned before it enters the
+//! pipeline:
 //!
 //! ```no_run
 //! use penstock_contrib::kafka::{ClientConfig, KafkaSource};
-//! use serde::Deserialize;
-//!
-//! #[derive(Deserialize)]
-//! struct Event {
-//!     id: u64,
-//! }
-//!
 //! let mut config = ClientConfig::new();
 //! config
 //!     .set("bootstrap.servers", "localhost:9092")
 //!     .set("group.id", "event-pipeline")
 //!     .set("auto.offset.reset", "earliest");
 //!
-//! let raw = KafkaSource::raw(config.clone(), &["events"])?;
-//! let json = KafkaSource::json::<Event>(config, &["events"])?;
+//! let source = KafkaSource::from_config(config, &["events"])?
+//!     .payload_deserializer(|bytes| Ok::<_, std::convert::Infallible>(bytes.to_vec()))
+//!     .build();
 //! # Ok::<_, penstock_contrib::kafka::KafkaSourceError>(())
 //! ```
 //!
 //! The source disables automatic commits and offset storage. It synchronously commits exact
 //! per-partition offsets only after Penstock reports successful delivery. Configure
 //! `max.poll.interval.ms` above the worst-case time spent transforming and delivering a batch.
+//!
+//! Callers that need a custom consumer context can construct the consumer with this module's
+//! re-exported [`rdkafka`] version and pass its `Arc` to [`KafkaSource::from_consumer`]. Retaining
+//! another clone lets the caller manage subscriptions and inspect consumer metadata.
 
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{
+    collections::HashMap, convert::Infallible, future::Future, marker::PhantomData, sync::Arc,
+};
 
 use futures_core::Stream;
 use futures_util::StreamExt;
 use penstock_core::{Record, Source};
-pub use rdkafka::config::ClientConfig;
+pub use rdkafka::{self, config::ClientConfig};
 use rdkafka::{
     Message,
-    consumer::{CommitMode, Consumer, StreamConsumer},
+    consumer::{CommitMode, Consumer, ConsumerContext, DefaultConsumerContext, StreamConsumer},
     error::KafkaError,
-    message::{Headers, Timestamp},
+    message::{Header, Headers, OwnedHeaders, Timestamp},
     topic_partition_list::{Offset, TopicPartitionList},
 };
-use serde::de::DeserializeOwned;
 use thiserror::Error;
 
-/// A Kafka header with owned key and value storage.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KafkaHeader {
-    pub key: String,
-    pub value: Option<Vec<u8>>,
+/// Decoded Kafka contents with owned values and per-field decode outcomes.
+///
+/// Deserialization failures are emitted as records instead of terminating the source stream. A
+/// downstream stage can inspect them and decide whether accepting the record should advance its
+/// Kafka offset. Topic, partition, and raw consumed offset live in the enclosing
+/// [`Record`]'s [`KafkaPosition`]; this type holds the message contents and other broker metadata.
+#[derive(Debug, Clone)]
+pub struct KafkaRecord<K, P, KeyError = Infallible, PayloadError = Infallible> {
+    /// `None` when no key was present; otherwise the key's deserialization outcome.
+    pub key: Option<Result<K, KeyError>>,
+    /// `None` for a tombstone; otherwise the payload's deserialization outcome.
+    pub payload: Option<Result<P, PayloadError>>,
+    pub timestamp: Timestamp,
+    pub headers: Option<OwnedHeaders>,
 }
 
-/// The broker timestamp attached to a Kafka message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KafkaTimestamp {
-    NotAvailable,
-    CreateTime(i64),
-    LogAppendTime(i64),
+/// Synchronously converts borrowed Kafka bytes into an owned value.
+///
+/// Both successful values and errors are carried in [`KafkaRecord`] for downstream handling.
+pub trait KafkaDeserializer: Send + Sync {
+    type Output: Send;
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn deserialize(&self, bytes: &[u8]) -> Result<Self::Output, Self::Error>;
 }
 
-impl From<Timestamp> for KafkaTimestamp {
-    fn from(timestamp: Timestamp) -> Self {
-        match timestamp {
-            Timestamp::NotAvailable => Self::NotAvailable,
-            Timestamp::CreateTime(milliseconds) => Self::CreateTime(milliseconds),
-            Timestamp::LogAppendTime(milliseconds) => Self::LogAppendTime(milliseconds),
-        }
+/// Default key policy: preserve key presence but discard its bytes.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoKeyDeserializer;
+
+impl KafkaDeserializer for NoKeyDeserializer {
+    type Output = ();
+    type Error = Infallible;
+
+    fn deserialize(&self, _bytes: &[u8]) -> Result<Self::Output, Self::Error> {
+        Ok(())
     }
 }
 
-/// An owned Kafka message whose payload representation depends on the source decoding mode.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KafkaMessage<P> {
-    pub payload: P,
-    pub key: Option<Vec<u8>>,
-    pub topic: String,
-    pub partition: i32,
-    pub offset: i64,
-    pub timestamp: KafkaTimestamp,
-    pub headers: Vec<KafkaHeader>,
+/// Adapter used by the builder for a deserializer function or closure.
+pub struct FnDeserializer<F, T, E> {
+    function: F,
+    output: PhantomData<fn() -> Result<T, E>>,
 }
 
-/// Absolute next offsets keyed by topic and partition.
+impl<F, T, E> KafkaDeserializer for FnDeserializer<F, T, E>
+where
+    F: Fn(&[u8]) -> Result<T, E> + Send + Sync,
+    T: Send,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    type Output = T;
+    type Error = E;
+
+    fn deserialize(&self, bytes: &[u8]) -> Result<Self::Output, Self::Error> {
+        (self.function)(bytes)
+    }
+}
+
+/// Last delivered offsets keyed by topic and partition.
 ///
 /// The source folds the message-local positions in each batch into this map, which translates
-/// directly into a [`TopicPartitionList`] when the batch is delivered.
-pub type KafkaCursor = HashMap<(String, i32), i64>;
+/// into Kafka's next-offset convention when the batch is committed.
+pub type KafkaCheckpoint = HashMap<(String, i32), i64>;
 
-/// The next offset for the topic-partition of one consumed message.
+/// The broker position of one consumed message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KafkaPosition {
     pub topic: String,
     pub partition: i32,
-    pub next_offset: i64,
+    pub offset: i64,
 }
 
-/// Kafka source construction, consumption, decoding, or commit failure.
+/// Kafka source construction, consumption, or commit failure.
 #[derive(Debug, Error)]
-pub enum KafkaSourceError {
+pub enum KafkaSourceError<CommitError = BrokerCommitterError>
+where
+    CommitError: std::error::Error + 'static,
+{
     #[error("at least one Kafka topic is required")]
     NoTopics,
     #[error("Kafka operation failed")]
     Kafka(#[from] KafkaError),
-    #[error("Kafka message at {topic}[{partition}] offset {offset} has no payload")]
-    MissingPayload {
-        topic: String,
-        partition: i32,
-        offset: i64,
-    },
-    #[error("Kafka JSON payload could not be decoded")]
-    Json(#[from] serde_json::Error),
+    #[error("Kafka checkpoint commit failed")]
+    Commit(#[source] CommitError),
+}
+
+/// Failure while synchronously committing a checkpoint to Kafka consumer-group offsets.
+#[derive(Debug, Error)]
+pub enum BrokerCommitterError {
+    #[error("Kafka commit task failed")]
+    Task(#[source] tokio::task::JoinError),
+    #[error("Kafka commit failed")]
+    Kafka(#[from] KafkaError),
     #[error("Kafka offset at {topic}[{partition}] cannot be advanced beyond {offset}")]
     OffsetExhausted {
         topic: String,
         partition: i32,
         offset: i64,
     },
-    #[error("Kafka commit task failed")]
-    CommitTask(#[source] tokio::task::JoinError),
 }
 
-/// Marker selecting owned raw payload bytes.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Raw;
-
-/// Marker selecting JSON decoding into `T`.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Json<T>(PhantomData<fn() -> T>);
-
-fn raw_payload<M: Message + ?Sized>(message: &M) -> Option<Vec<u8>> {
-    message.payload().map(<[u8]>::to_vec)
-}
-
-fn json_payload<T, M>(message: &M) -> Result<T, KafkaSourceError>
-where
-    T: DeserializeOwned,
-    M: Message + ?Sized,
-{
-    let payload = message
-        .payload()
-        .ok_or_else(|| KafkaSourceError::MissingPayload {
-            topic: message.topic().to_owned(),
-            partition: message.partition(),
-            offset: message.offset(),
-        })?;
-    Ok(serde_json::from_slice(payload)?)
-}
-
-fn message_with_payload<M, P>(message: &M, payload: P) -> KafkaMessage<P>
+fn message_position<M>(message: &M) -> KafkaPosition
 where
     M: Message + ?Sized,
 {
-    let headers = message
-        .headers()
-        .map(|headers| {
-            headers
-                .iter()
-                .map(|header| KafkaHeader {
-                    key: header.key.to_owned(),
-                    value: header.value.map(<[u8]>::to_vec),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    KafkaMessage {
-        payload,
-        key: message.key().map(<[u8]>::to_vec),
+    KafkaPosition {
         topic: message.topic().to_owned(),
         partition: message.partition(),
         offset: message.offset(),
-        timestamp: message.timestamp().into(),
-        headers,
     }
 }
 
-fn message_position<M>(message: &M) -> Result<KafkaPosition, KafkaSourceError>
+fn copy_headers<H>(headers: &H) -> OwnedHeaders
 where
-    M: Message + ?Sized,
+    H: Headers,
 {
-    let offset = message.offset();
-    let next_offset = offset
-        .checked_add(1)
-        .ok_or_else(|| KafkaSourceError::OffsetExhausted {
-            topic: message.topic().to_owned(),
-            partition: message.partition(),
-            offset,
-        })?;
-    Ok(KafkaPosition {
-        topic: message.topic().to_owned(),
-        partition: message.partition(),
-        next_offset,
-    })
+    headers.iter().fold(
+        OwnedHeaders::new_with_capacity(headers.count()),
+        |owned, header| {
+            owned.insert(Header {
+                key: header.key,
+                value: header.value,
+            })
+        },
+    )
 }
 
-/// Persists successful cursor snapshots to Kafka consumer-group offsets.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct BrokerCheckpoint;
+type DeserializedRecord<Kd, Pd> = KafkaRecord<
+    <Kd as KafkaDeserializer>::Output,
+    <Pd as KafkaDeserializer>::Output,
+    <Kd as KafkaDeserializer>::Error,
+    <Pd as KafkaDeserializer>::Error,
+>;
 
-impl BrokerCheckpoint {
+/// Commits successfully delivered Kafka checkpoints.
+pub trait KafkaCommitter<C>: Send + Sync
+where
+    C: ConsumerContext + 'static,
+{
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn commit(
+        &self,
+        consumer: Arc<StreamConsumer<C>>,
+        checkpoint: KafkaCheckpoint,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// Commits checkpoints to Kafka consumer-group offsets.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BrokerCommitter;
+
+impl<C> KafkaCommitter<C> for BrokerCommitter
+where
+    C: ConsumerContext + 'static,
+{
+    type Error = BrokerCommitterError;
+
     async fn commit(
-        self,
-        consumer: Arc<StreamConsumer>,
-        cursor: KafkaCursor,
-    ) -> Result<(), KafkaSourceError> {
-        tokio::task::spawn_blocking(move || {
-            let mut partitions = TopicPartitionList::with_capacity(cursor.len());
-            for ((topic, partition), offset) in cursor {
-                partitions.add_partition_offset(&topic, partition, Offset::Offset(offset))?;
+        &self,
+        consumer: Arc<StreamConsumer<C>>,
+        checkpoint: KafkaCheckpoint,
+    ) -> Result<(), Self::Error> {
+        tokio::task::spawn_blocking(move || -> Result<(), BrokerCommitterError> {
+            let mut partitions = TopicPartitionList::with_capacity(checkpoint.len());
+            for ((topic, partition), offset) in checkpoint {
+                let next_offset =
+                    offset
+                        .checked_add(1)
+                        .ok_or_else(|| BrokerCommitterError::OffsetExhausted {
+                            topic: topic.clone(),
+                            partition,
+                            offset,
+                        })?;
+                partitions.add_partition_offset(&topic, partition, Offset::Offset(next_offset))?;
             }
-            consumer.commit(&partitions, CommitMode::Sync)
+            consumer.commit(&partitions, CommitMode::Sync)?;
+            Ok(())
         })
         .await
-        .map_err(KafkaSourceError::CommitTask)??;
+        .map_err(BrokerCommitterError::Task)??;
         Ok(())
     }
 }
 
-/// A subscribed Kafka-compatible consumer source.
-///
-/// Use [`KafkaSource::raw`] for owned bytes or [`KafkaSource::json`] for strict Serde JSON
-/// decoding. The supplied consumer config is forced to use manual offset management.
-pub struct KafkaSource<D = Raw> {
-    consumer: Arc<StreamConsumer>,
-    mode: PhantomData<fn() -> D>,
-    checkpoint: BrokerCheckpoint,
+/// Disables Kafka consumer-group offset commits.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoCommitter;
+
+impl<C> KafkaCommitter<C> for NoCommitter
+where
+    C: ConsumerContext + 'static,
+{
+    type Error = Infallible;
+
+    async fn commit(
+        &self,
+        _consumer: Arc<StreamConsumer<C>>,
+        _checkpoint: KafkaCheckpoint,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
-impl KafkaSource<Raw> {
-    pub fn raw(config: ClientConfig, topics: &[&str]) -> Result<Self, KafkaSourceError> {
-        Self::build(config, topics)
-    }
+/// Type-state marker for a deserializer that has not been configured.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MissingDeserializer;
 
-    pub fn json<T>(
-        config: ClientConfig,
-        topics: &[&str],
-    ) -> Result<KafkaSource<Json<T>>, KafkaSourceError>
+/// Builds a typed Kafka source from an externally managed consumer.
+pub struct KafkaSourceBuilder<
+    C,
+    Kd = NoKeyDeserializer,
+    Pd = MissingDeserializer,
+    Cm = BrokerCommitter,
+> where
+    C: ConsumerContext + 'static,
+{
+    consumer: Arc<StreamConsumer<C>>,
+    key_deserializer: Kd,
+    payload_deserializer: Pd,
+    committer: Cm,
+}
+
+impl<C, Kd, Pd, Cm> KafkaSourceBuilder<C, Kd, Pd, Cm>
+where
+    C: ConsumerContext + 'static,
+{
+    pub fn key_deserializer<F, T, E>(
+        self,
+        deserializer: F,
+    ) -> KafkaSourceBuilder<C, FnDeserializer<F, T, E>, Pd, Cm>
     where
-        T: DeserializeOwned + Send,
+        F: Fn(&[u8]) -> Result<T, E> + Send + Sync,
+        T: Send,
+        E: std::error::Error + Send + Sync + 'static,
     {
-        KafkaSource::build(config, topics)
+        KafkaSourceBuilder {
+            consumer: self.consumer,
+            key_deserializer: FnDeserializer {
+                function: deserializer,
+                output: PhantomData,
+            },
+            payload_deserializer: self.payload_deserializer,
+            committer: self.committer,
+        }
+    }
+
+    pub fn payload_deserializer<F, T, E>(
+        self,
+        deserializer: F,
+    ) -> KafkaSourceBuilder<C, Kd, FnDeserializer<F, T, E>, Cm>
+    where
+        F: Fn(&[u8]) -> Result<T, E> + Send + Sync,
+        T: Send,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        KafkaSourceBuilder {
+            consumer: self.consumer,
+            key_deserializer: self.key_deserializer,
+            payload_deserializer: FnDeserializer {
+                function: deserializer,
+                output: PhantomData,
+            },
+            committer: self.committer,
+        }
+    }
+
+    pub fn committer<Next>(self, committer: Next) -> KafkaSourceBuilder<C, Kd, Pd, Next> {
+        KafkaSourceBuilder {
+            consumer: self.consumer,
+            key_deserializer: self.key_deserializer,
+            payload_deserializer: self.payload_deserializer,
+            committer,
+        }
     }
 }
 
-impl<D> KafkaSource<D> {
-    fn build(config: ClientConfig, topics: &[&str]) -> Result<Self, KafkaSourceError> {
-        let mut config = config;
+impl<C, Kd, Pd, Cm> KafkaSourceBuilder<C, Kd, Pd, Cm>
+where
+    C: ConsumerContext + 'static,
+    Kd: KafkaDeserializer,
+    Pd: KafkaDeserializer,
+    Cm: KafkaCommitter<C>,
+{
+    pub fn build(self) -> KafkaSource<C, Kd, Pd, Cm> {
+        KafkaSource {
+            consumer: self.consumer,
+            key_deserializer: self.key_deserializer,
+            payload_deserializer: self.payload_deserializer,
+            committer: self.committer,
+        }
+    }
+}
+
+/// A Kafka-compatible source with inline key and payload deserialization.
+pub struct KafkaSource<C, Kd, Pd, Cm = BrokerCommitter>
+where
+    C: ConsumerContext + 'static,
+{
+    consumer: Arc<StreamConsumer<C>>,
+    key_deserializer: Kd,
+    payload_deserializer: Pd,
+    committer: Cm,
+}
+
+impl KafkaSource<DefaultConsumerContext, NoKeyDeserializer, MissingDeserializer> {
+    /// Builds a Kafka source around an existing consumer.
+    ///
+    /// Unlike [`KafkaSource::from_config`], this constructor does not modify the consumer
+    /// configuration or subscribe it to any topics. The caller is responsible for configuring
+    /// safe offset management before creating the consumer, subscribing it before the source is
+    /// polled, and managing any subsequent subscription changes.
+    ///
+    /// For the offset-management settings used by the default broker committer, see
+    /// [`KafkaSource::from_config`]. In particular, automatic commits and automatic offset storage
+    /// should be disabled.
+    pub fn from_consumer<C>(
+        consumer: Arc<StreamConsumer<C>>,
+    ) -> KafkaSourceBuilder<C, NoKeyDeserializer, MissingDeserializer>
+    where
+        C: ConsumerContext + 'static,
+    {
+        KafkaSourceBuilder {
+            consumer,
+            key_deserializer: NoKeyDeserializer,
+            payload_deserializer: MissingDeserializer,
+            committer: BrokerCommitter,
+        }
+    }
+
+    /// Creates, safely configures, and subscribes a default-context consumer.
+    ///
+    /// This forces `enable.auto.commit=false` and `enable.auto.offset.store=false`, ensuring that
+    /// offsets are advanced only through the source's committer after successful
+    /// delivery.
+    pub fn from_config(
+        mut config: ClientConfig,
+        topics: &[&str],
+    ) -> Result<
+        KafkaSourceBuilder<DefaultConsumerContext, NoKeyDeserializer, MissingDeserializer>,
+        KafkaSourceError,
+    > {
         if topics.is_empty() {
             return Err(KafkaSourceError::NoTopics);
         }
-
         config
             .set("enable.auto.commit", "false")
             .set("enable.auto.offset.store", "false");
         let consumer: StreamConsumer = config.create()?;
         consumer.subscribe(topics)?;
 
-        Ok(Self {
-            consumer: Arc::new(consumer),
-            mode: PhantomData,
-            checkpoint: BrokerCheckpoint,
-        })
+        Ok(Self::from_consumer(Arc::new(consumer)))
     }
+}
 
-    fn record<P, M>(
+fn track_checkpoint(
+    checkpoint: Option<KafkaCheckpoint>,
+    position: &KafkaPosition,
+) -> KafkaCheckpoint {
+    let mut checkpoint = checkpoint.unwrap_or_default();
+    checkpoint
+        .entry((position.topic.clone(), position.partition))
+        .and_modify(|offset| *offset = (*offset).max(position.offset))
+        .or_insert(position.offset);
+    checkpoint
+}
+
+impl<C, Kd, Pd, Cm> KafkaSource<C, Kd, Pd, Cm>
+where
+    C: ConsumerContext + 'static,
+    Kd: KafkaDeserializer,
+    Pd: KafkaDeserializer,
+    Cm: KafkaCommitter<C>,
+{
+    fn record_from_message<M>(
         &self,
-        source: &M,
-        payload: P,
-    ) -> Result<Record<KafkaMessage<P>, KafkaPosition>, KafkaSourceError>
+        message: &M,
+    ) -> Record<DeserializedRecord<Kd, Pd>, KafkaPosition>
     where
         M: Message + ?Sized,
     {
-        let position = message_position(source)?;
-        Ok(Record::new(position, message_with_payload(source, payload)))
-    }
-
-    async fn commit_cursor(&self, cursor: KafkaCursor) -> Result<(), KafkaSourceError> {
-        self.checkpoint
-            .commit(Arc::clone(&self.consumer), cursor)
-            .await
-    }
-
-    fn track(cursor: Option<KafkaCursor>, position: KafkaPosition) -> KafkaCursor {
-        let mut cursor = cursor.unwrap_or_default();
-        cursor
-            .entry((position.topic, position.partition))
-            .and_modify(|offset| *offset = (*offset).max(position.next_offset))
-            .or_insert(position.next_offset);
-        cursor
+        let position = message_position(message);
+        let record = KafkaRecord {
+            key: message
+                .key()
+                .map(|bytes| self.key_deserializer.deserialize(bytes)),
+            payload: message
+                .payload()
+                .map(|bytes| self.payload_deserializer.deserialize(bytes)),
+            timestamp: message.timestamp(),
+            headers: message.headers().map(copy_headers),
+        };
+        Record::new(position, record)
     }
 }
 
-impl Source for KafkaSource<Raw> {
-    type Payload = KafkaMessage<Option<Vec<u8>>>;
-    type Position = KafkaPosition;
-    type Cursor = KafkaCursor;
-    type Error = KafkaSourceError;
-
-    fn stream(
-        &self,
-    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_
-    {
-        self.consumer.stream().map(|source| {
-            source
-                .map_err(KafkaSourceError::Kafka)
-                .and_then(|source| self.record(&source, raw_payload(&source)))
-        })
-    }
-
-    fn track(cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
-        KafkaSource::<Raw>::track(cursor, position)
-    }
-
-    async fn commit(&self, cursor: Self::Cursor) -> Result<(), Self::Error> {
-        self.commit_cursor(cursor).await
-    }
-}
-
-impl<T> Source for KafkaSource<Json<T>>
+impl<C, Kd, Pd, Cm> Source for KafkaSource<C, Kd, Pd, Cm>
 where
-    T: DeserializeOwned + Send,
+    C: ConsumerContext + 'static,
+    Kd: KafkaDeserializer,
+    Pd: KafkaDeserializer,
+    Cm: KafkaCommitter<C>,
 {
-    type Payload = KafkaMessage<T>;
+    type Payload = DeserializedRecord<Kd, Pd>;
     type Position = KafkaPosition;
-    type Cursor = KafkaCursor;
-    type Error = KafkaSourceError;
+    type Checkpoint = KafkaCheckpoint;
+    type Error = KafkaSourceError<Cm::Error>;
 
     fn stream(
         &self,
     ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_
     {
-        self.consumer.stream().map(|source| {
-            source.map_err(KafkaSourceError::Kafka).and_then(|source| {
-                let payload = json_payload(&source)?;
-                self.record(&source, payload)
-            })
+        self.consumer.stream().map(|message| {
+            message
+                .map(|message| self.record_from_message(&message))
+                .map_err(KafkaSourceError::Kafka)
         })
     }
 
-    fn track(cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
-        KafkaSource::<Json<T>>::track(cursor, position)
+    fn track(checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
+        track_checkpoint(checkpoint, position)
     }
 
-    async fn commit(&self, cursor: Self::Cursor) -> Result<(), Self::Error> {
-        self.commit_cursor(cursor).await
+    async fn commit(&self, checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
+        self.committer
+            .commit(Arc::clone(&self.consumer), checkpoint)
+            .await
+            .map_err(KafkaSourceError::Commit)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use penstock_core::Source;
-    use rdkafka::message::{Header, OwnedHeaders, OwnedMessage};
+    use rdkafka::{
+        ClientContext,
+        message::{OwnedMessage, Timestamp},
+    };
 
     use super::*;
-
-    fn message(payload: Option<Vec<u8>>) -> OwnedMessage {
-        OwnedMessage::new(
-            payload,
-            Some(b"key".to_vec()),
-            "events".to_owned(),
-            Timestamp::CreateTime(42),
-            3,
-            7,
-            Some(
-                OwnedHeaders::new()
-                    .insert(Header {
-                        key: "trace",
-                        value: Some(b"first"),
-                    })
-                    .insert(Header {
-                        key: "trace",
-                        value: None::<&[u8]>,
-                    }),
-            ),
-        )
-    }
 
     fn message_at(partition: i32, offset: i64) -> OwnedMessage {
         OwnedMessage::new(
@@ -387,92 +501,231 @@ mod tests {
     }
 
     #[test]
-    fn raw_decoder_preserves_tombstones() {
-        assert_eq!(raw_payload(&message(None)), None);
-    }
-
-    #[test]
-    fn raw_source_preserves_owned_message_metadata() {
-        let source = message(Some(b"payload".to_vec()));
-        let message = message_with_payload(&source, raw_payload(&source));
-
-        assert_eq!(message.payload, Some(b"payload".to_vec()));
-        assert_eq!(message.key, Some(b"key".to_vec()));
-        assert_eq!(message.topic, "events");
-        assert_eq!(message.partition, 3);
-        assert_eq!(message.offset, 7);
-        assert_eq!(message.timestamp, KafkaTimestamp::CreateTime(42));
-        assert_eq!(
-            message.headers,
-            vec![
-                KafkaHeader {
-                    key: "trace".to_owned(),
-                    value: Some(b"first".to_vec()),
-                },
-                KafkaHeader {
-                    key: "trace".to_owned(),
-                    value: None,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn json_decoder_decodes_known_types_and_rejects_bad_payloads() {
-        assert_eq!(
-            json_payload::<Option<Vec<u64>>, _>(&message(Some(b"[1,2]".to_vec()))).unwrap(),
-            Some(vec![1, 2])
-        );
-        assert_eq!(
-            json_payload::<Option<Vec<u64>>, _>(&message(Some(b"null".to_vec()))).unwrap(),
-            None
-        );
-        assert!(matches!(
-            json_payload::<Vec<u64>, _>(&message(None)),
-            Err(KafkaSourceError::MissingPayload { .. })
-        ));
-        assert!(matches!(
-            json_payload::<Vec<u64>, _>(&message(Some(b"not-json".to_vec()))),
-            Err(KafkaSourceError::Json(_))
-        ));
-    }
-
-    #[test]
-    fn cursor_folds_interleaved_partition_positions() {
-        let cursor = [message_at(0, 4), message_at(1, 9), message_at(0, 5)]
+    fn checkpoint_folds_interleaved_partition_positions() {
+        let checkpoint = [message_at(0, 4), message_at(1, 9), message_at(0, 5)]
             .iter()
             .map(message_position)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-            .into_iter()
-            .fold(None, |cursor, position| {
-                Some(KafkaSource::<Raw>::track(cursor, position))
+            .fold(None, |checkpoint, position| {
+                Some(track_checkpoint(checkpoint, &position))
             })
             .unwrap();
 
-        assert_eq!(cursor.get(&("events".to_owned(), 0)), Some(&6));
-        assert_eq!(cursor.get(&("events".to_owned(), 1)), Some(&10));
+        assert_eq!(checkpoint.get(&("events".to_owned(), 0)), Some(&5));
+        assert_eq!(checkpoint.get(&("events".to_owned(), 1)), Some(&9));
     }
 
-    #[test]
-    fn cursor_rejects_exhausted_offsets() {
+    #[tokio::test]
+    async fn broker_committer_rejects_an_exhausted_offset() {
+        let checkpoint = HashMap::from([(("events".to_owned(), 0), i64::MAX)]);
+
         assert!(matches!(
-            message_position(&message_at(0, i64::MAX)),
-            Err(KafkaSourceError::OffsetExhausted { .. })
+            BrokerCommitter.commit(custom_consumer(), checkpoint).await,
+            Err(BrokerCommitterError::OffsetExhausted { .. })
         ));
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct Utf8Deserializer;
+
+    impl KafkaDeserializer for Utf8Deserializer {
+        type Output = String;
+        type Error = std::str::Utf8Error;
+
+        fn deserialize(&self, bytes: &[u8]) -> Result<Self::Output, Self::Error> {
+            Ok(std::str::from_utf8(bytes)?.to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn record_preserves_missing_successful_and_failed_decode_outcomes() {
+        let decoding_source = KafkaSource {
+            consumer: custom_consumer(),
+            key_deserializer: Utf8Deserializer,
+            payload_deserializer: Utf8Deserializer,
+            committer: BrokerCommitter,
+        };
+        let invalid_payload = OwnedMessage::new(
+            Some(vec![0xff]),
+            Some(b"key".to_vec()),
+            "events".to_owned(),
+            Timestamp::NotAvailable,
+            0,
+            0,
+            None,
+        );
+        let decoded = decoding_source
+            .record_from_message(&invalid_payload)
+            .payload;
+
+        assert_eq!(decoded.key.unwrap().unwrap(), "key");
+        assert!(matches!(decoded.payload, Some(Err(_))));
+
+        let absent = OwnedMessage::new(
+            None,
+            None,
+            "events".to_owned(),
+            Timestamp::NotAvailable,
+            0,
+            1,
+            None,
+        );
+        let ignoring_source = KafkaSource {
+            consumer: custom_consumer(),
+            key_deserializer: NoKeyDeserializer,
+            payload_deserializer: Utf8Deserializer,
+            committer: BrokerCommitter,
+        };
+        let decoded = ignoring_source.record_from_message(&absent).payload;
+
+        assert!(decoded.key.is_none());
+        assert!(decoded.payload.is_none());
+
+        let ignored_key = OwnedMessage::new(
+            None,
+            Some(b"ignored".to_vec()),
+            "events".to_owned(),
+            Timestamp::NotAvailable,
+            0,
+            2,
+            None,
+        );
+        let decoded = ignoring_source.record_from_message(&ignored_key).payload;
+
+        assert!(matches!(decoded.key, Some(Ok(()))));
     }
 
     #[test]
     fn source_rejects_an_empty_subscription() {
         assert!(matches!(
-            KafkaSource::raw(ClientConfig::new(), &[]),
+            KafkaSource::from_config(ClientConfig::new(), &[]),
             Err(KafkaSourceError::NoTopics)
+        ));
+    }
+
+    #[derive(Clone, Default)]
+    struct TestContext;
+
+    impl ClientContext for TestContext {}
+    impl ConsumerContext for TestContext {}
+
+    fn custom_consumer() -> Arc<StreamConsumer<TestContext>> {
+        let mut config = ClientConfig::new();
+        config
+            .set("bootstrap.servers", "localhost:1")
+            .set("group.id", "penstock-custom-context-test")
+            .set("enable.auto.commit", "false")
+            .set("enable.auto.offset.store", "false");
+        Arc::new(config.create_with_context(TestContext).unwrap())
+    }
+
+    fn bytes(value: &[u8]) -> Result<Vec<u8>, Infallible> {
+        Ok(value.to_vec())
+    }
+
+    #[tokio::test]
+    async fn custom_context_source_uses_externally_controlled_consumer() {
+        let consumer = custom_consumer();
+        consumer.subscribe(&["events"]).unwrap();
+        assert_eq!(
+            consumer.subscription().unwrap().elements()[0].topic(),
+            "events"
+        );
+        assert_eq!(consumer.assignment().unwrap().count(), 0);
+
+        let _source = KafkaSource::from_consumer(Arc::clone(&consumer))
+            .key_deserializer(bytes)
+            .payload_deserializer(bytes)
+            .build();
+    }
+
+    #[derive(Clone)]
+    struct RecordingCommitter(Arc<Mutex<Vec<KafkaCheckpoint>>>);
+
+    impl<C> KafkaCommitter<C> for RecordingCommitter
+    where
+        C: ConsumerContext + 'static,
+    {
+        type Error = Infallible;
+
+        async fn commit(
+            &self,
+            _consumer: Arc<StreamConsumer<C>>,
+            checkpoint: KafkaCheckpoint,
+        ) -> Result<(), Self::Error> {
+            self.0.lock().unwrap().push(checkpoint);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn committer_is_injected_and_observes_exact_checkpoint() {
+        let commits = Arc::new(Mutex::new(Vec::new()));
+        let source = KafkaSource::from_consumer(custom_consumer())
+            .key_deserializer(bytes)
+            .payload_deserializer(bytes)
+            .committer(RecordingCommitter(Arc::clone(&commits)))
+            .build();
+        let checkpoint = HashMap::from([(("events".to_owned(), 2), 41)]);
+
+        source.commit(checkpoint.clone()).await.unwrap();
+
+        assert_eq!(*commits.lock().unwrap(), vec![checkpoint]);
+    }
+
+    #[tokio::test]
+    async fn no_committer_accepts_a_checkpoint_without_broker_commit() {
+        let source = KafkaSource::from_consumer(custom_consumer())
+            .key_deserializer(bytes)
+            .payload_deserializer(bytes)
+            .committer(NoCommitter)
+            .build();
+        let checkpoint = HashMap::from([(("events".to_owned(), 0), 1)]);
+
+        source.commit(checkpoint).await.unwrap();
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("recording commit failed")]
+    struct RecordingCommitError;
+
+    struct FailingCommitter;
+
+    impl<C> KafkaCommitter<C> for FailingCommitter
+    where
+        C: ConsumerContext + 'static,
+    {
+        type Error = RecordingCommitError;
+
+        async fn commit(
+            &self,
+            _consumer: Arc<StreamConsumer<C>>,
+            _checkpoint: KafkaCheckpoint,
+        ) -> Result<(), Self::Error> {
+            Err(RecordingCommitError)
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_failure_retains_its_typed_cause() {
+        let source = KafkaSource::from_consumer(custom_consumer())
+            .key_deserializer(bytes)
+            .payload_deserializer(bytes)
+            .committer(FailingCommitter)
+            .build();
+
+        assert!(matches!(
+            source.commit(KafkaCheckpoint::new()).await,
+            Err(KafkaSourceError::Commit(RecordingCommitError))
         ));
     }
 
     #[allow(dead_code)]
     fn source_contract_is_send_sync() {
-        fn assert_source<S: Source + Send + Sync>() {}
-        assert_source::<KafkaSource<Raw>>();
+        fn assert_source<S: Source + Send + Sync>(_: &S) {}
+        let source = KafkaSource::from_consumer(custom_consumer())
+            .key_deserializer(bytes)
+            .payload_deserializer(bytes)
+            .build();
+        assert_source(&source);
     }
 }
