@@ -1,26 +1,38 @@
 [workspace]
 resolver = "3"
 members = [
-    "penstock",
-    "penstock-contrib",
-    "penstock-core",
-    "penstock-io",
+  "penstock",
+  "penstock-contrib",
+  "penstock-core",
+  "penstock-io",
 ]
 default-members = ["penstock"]
 
 [workspace.package]
-edition = "2024"
 version = "0.1.0"
+edition = "2024"
 
 [workspace.dependencies]
 futures-core = "0.3.33"
-futures-util = { version = "0.3.33", default-features = false, features = ["async-await", "std"] }
+futures-util = {
+  version = "0.3.33",
+  default-features = false,
+  features = ["async-await", "std"]
+}
 metrics = "0.24.2"
 object_store = "0.14.1"
-penstock-core = { version = "0.1.0", path = "penstock-core" }
-penstock-contrib = { version = "0.1.0", path = "penstock-contrib" }
-penstock-io = { version = "0.1.0", path = "penstock-io", default-features = false }
-rdkafka = { version = "0.39.0", default-features = false, features = ["cmake-build", "libz", "ssl", "tokio"] }
+penstock-contrib = { path = "penstock-contrib", version = "0.1.0" }
+penstock-core = { path = "penstock-core", version = "0.1.0" }
+penstock-io = {
+  path = "penstock-io",
+  version = "0.1.0",
+  default-features = false
+}
+rdkafka = {
+  version = "0.39.0",
+  default-features = false,
+  features = ["cmake-build", "libz", "ssl", "tokio"]
+}
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sqlx-core = { version = "=0.8.6", default-features = false }
@@ -32,9 +44,12 @@ thiserror = "2.0.19"
 tokio = { version = "1.53.1", default-features = false }
 tokio-stream = { version = "0.1.19", features = ["time"] }
 
-[workspace.lints.rust]
-unsafe_code = "forbid"
-
 [workspace.lints.clippy]
 all = "warn"
 complexity = { level = "warn", priority = -1 }
+expect_used = "warn"
+print_stdout = "warn"
+unwrap_used = "warn"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

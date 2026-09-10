@@ -1,0 +1,10 @@
+[lint.rules]
+# Cargo manifests here order tables thematically, not depth-first — e.g. the workspace
+# Cargo.toml groups [workspace.dependencies] under commented sections, and crate manifests put
+# [features] beside [package] — so "defining tables out-of-order is discouraged" only fights
+# deliberate layout. Everything else stays at Tombi's defaults.
+tables-out-of-order = "off"
+
+[[schemas]]
+path = "bifrost.schema.json"
+include = ["config/*.toml"]

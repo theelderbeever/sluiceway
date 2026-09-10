@@ -1,0 +1,6 @@
+# Pins the exact stable release CI and local builds resolve to, so `cargo build`/`clippy`/`test`
+# are reproducible across machines. The format check runs on nightly out of band
+# (`cargo +nightly fmt`), because `.rustfmt.toml` enables `unstable_features`.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
