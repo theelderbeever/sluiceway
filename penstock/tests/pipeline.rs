@@ -1,6 +1,7 @@
 use std::{
     cell::Cell,
     convert::Infallible,
+    num::NonZeroUsize,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -12,7 +13,7 @@ use futures_core::Stream;
 use futures_util::{StreamExt, stream};
 use penstock::{
     Batch, BatchPolicy, BoxSink, CheckpointStore, DeliveryFailure, Identity, NoCheckpoint,
-    Pipeline, PipelineError, PipelineId, Record, SharedBatch, Sink, Source,
+    Pipeline, PipelineError, PipelineId, Record, SharedBatch, Sink, Source, Transformer,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,7 +183,7 @@ async fn linear_pipeline_moves_owned_transformed_batches_to_one_sink() {
         .transform(|number: u64| async move { Ok::<_, Infallible>(number.to_string()) })
         .sink(sink)
         .batched(BatchPolicy::try_new(2, Duration::from_secs(1)).unwrap())
-        .run_until(std::future::pending())
+        .run()
         .await
         .unwrap();
 
@@ -216,7 +217,7 @@ async fn cloned_fanout_reuses_owned_sinks() {
         .cloned()
         .sinks([collector.into(), counter.into()])
         .batched(BatchPolicy::try_new(2, Duration::from_secs(1)).unwrap())
-        .run_until(std::future::pending())
+        .run()
         .await
         .unwrap();
 
@@ -240,7 +241,7 @@ async fn cloned_fanout_does_not_require_sync_payloads() {
         .cloned()
         .sinks([first.into(), second.into()])
         .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
-        .run_until(std::future::pending())
+        .run()
         .await
         .unwrap();
 
@@ -262,7 +263,7 @@ async fn shared_fanout_does_not_require_clone_payloads() {
         .shared()
         .sinks([first.into(), second.into()])
         .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
-        .run_until(std::future::pending())
+        .run()
         .await
         .unwrap();
 
@@ -683,6 +684,111 @@ async fn timeout_and_end_of_stream_flush_partial_batches() {
         *committed.lock().unwrap(),
         vec![Cursor::at(0), Cursor::at(2)]
     );
+}
+
+#[tokio::test]
+async fn concurrent_transforms_retain_source_order() {
+    let (source, _) = source(vec![0, 1, 2]);
+    let transform = Transformer::new(|number: u64| async move {
+        tokio::time::sleep(Duration::from_millis((3 - number) * 5)).await;
+        Ok::<_, Infallible>(number)
+    })
+    .concurrency(NonZeroUsize::new(3).unwrap());
+    let (sink, records) = linear_collector(Ack::Exact);
+
+    Pipeline::source(source)
+        .transform(transform)
+        .sink(sink)
+        .batched(BatchPolicy::try_new(3, Duration::from_secs(1)).unwrap())
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(*records.lock().unwrap(), vec![0, 1, 2]);
+}
+
+struct GracefulSource {
+    shutdown: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    committed: Arc<Mutex<Vec<Cursor>>>,
+}
+
+impl Source for GracefulSource {
+    type Payload = u64;
+    type Position = Cursor;
+    type Cursor = Cursor;
+    type Error = tokio::sync::oneshot::error::RecvError;
+
+    fn stream(
+        &self,
+    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_
+    {
+        let shutdown = self
+            .shutdown
+            .lock()
+            .unwrap()
+            .take()
+            .expect("source stream can only be created once");
+        stream::once(async move {
+            shutdown.await?;
+            Ok(Record::new(Cursor::at(0), 10))
+        })
+        .chain(stream::iter([
+            Ok(Record::new(Cursor::at(1), 20)),
+            Ok(Record::new(Cursor::at(2), 30)),
+        ]))
+    }
+
+    fn track(_cursor: Option<Self::Cursor>, position: Self::Position) -> Self::Cursor {
+        position
+    }
+
+    async fn commit(&self, cursor: Self::Cursor) -> Result<(), Self::Error> {
+        self.committed.lock().unwrap().push(cursor);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn run_lets_the_source_own_shutdown_and_drain_to_eof() {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let committed = Arc::new(Mutex::new(Vec::new()));
+    let source = GracefulSource {
+        shutdown: Mutex::new(Some(shutdown_rx)),
+        committed: Arc::clone(&committed),
+    };
+    let (sink, records) = linear_collector(Ack::Exact);
+    shutdown_tx.send(()).unwrap();
+
+    Pipeline::source(source)
+        .transform(Identity)
+        .sink(sink)
+        .batched(BatchPolicy::try_new(10, Duration::from_secs(1)).unwrap())
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(*records.lock().unwrap(), vec![10, 20, 30]);
+    assert_eq!(*committed.lock().unwrap(), vec![Cursor::at(2)]);
+}
+
+#[tokio::test]
+async fn source_owned_shutdown_failure_is_a_source_error() {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let source = GracefulSource {
+        shutdown: Mutex::new(Some(shutdown_rx)),
+        committed: Arc::new(Mutex::new(Vec::new())),
+    };
+    let (sink, _) = linear_collector(Ack::Exact);
+    drop(shutdown_tx);
+
+    let result = Pipeline::source(source)
+        .transform(Identity)
+        .sink(sink)
+        .batched(BatchPolicy::try_new(10, Duration::from_secs(1)).unwrap())
+        .run()
+        .await;
+
+    assert!(matches!(result, Err(PipelineError::Source(_))));
 }
 
 struct OpenSource {

@@ -47,7 +47,7 @@ Pipeline::source(source)
     })
     .sink(sink)
     .batched(BatchPolicy::try_new(100, Duration::from_secs(1))?)
-    .run_until(std::future::pending())
+    .run()
     .await?;
 # Ok(())
 # }
@@ -72,7 +72,7 @@ Pipeline::source(source)
     .shared()
     .sinks([analytics.into(), archive.into()])
     .batched(BatchPolicy::try_new(100, Duration::from_secs(1))?)
-    .run_until(std::future::pending())
+    .run()
     .await?;
 # Ok(())
 # }
@@ -89,6 +89,18 @@ Individual source records carry message-local positions. When a batch closes, th
 those positions into its batch cursor while the runner moves the transformed payloads into the
 batch. The cursor remains opaque to the runner, and checkpoint persistence remains source-owned
 through `CheckpointStore<C>`.
+
+`run()` consumes through the source stream's natural end. Sources that own graceful shutdown
+should observe their configured signal inside `Source::stream`, stop external intake, drain any
+source-owned buffer, and then return `None`. `run_until(shutdown)` instead imposes a cutoff on
+source polling when its future resolves; transforms already admitted are completed and the final
+partial batch is flushed.
+
+Transforms run concurrently up to `Transform::max_concurrency` while their outputs remain in the
+source stream's observed order. Batches are delivered one at a time. A batch closes at its size
+limit, at source EOF, or when its timeout expires; the timeout starts when the first transformed
+record enters an empty batch. Sink delivery completes before commit begins, and any transform or
+sink failure prevents that batch's cursor from being committed.
 
 Checkpoint adapters are available through facade features. `io` enables local files,
 `object-store` adds caller-configured object stores, and `sql-postgres`, `sql-mysql`, and

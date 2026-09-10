@@ -26,3 +26,12 @@ for the batch. No branch names, indexes, transform stages, or task-ID metadata a
 Source records carry message-local positions. The source folds them into one cursor as transformed
 payloads are moved into a completed batch. The cursor remains opaque to the runner. Checkpoint
 persistence remains owned by sources through the generic `CheckpointStore<C>` interface.
+
+`run()` consumes until the source stream naturally ends. A source can own graceful shutdown by
+observing a signal in `Source::stream`, stopping intake, draining its internal buffer, and then
+returning `None`. `run_until(shutdown)` is an explicit cutoff: it stops polling the source when the
+future resolves, completes already admitted transforms, and flushes the partial batch.
+
+Transforms may run concurrently but their outputs remain in observed source order. Batches are
+delivered serially, and a cursor is committed only after successful delivery. The batch timeout
+starts when the first transformed record enters an empty batch.

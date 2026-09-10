@@ -214,6 +214,18 @@ where
     Tr: Transform<So::Payload>,
     Si: Sink<Batch<Tr::Out, So::Cursor>>,
 {
+    /// Run until the source stream reaches its natural end.
+    ///
+    /// Sources that need graceful shutdown should incorporate their shutdown signal into the
+    /// stream and return `None` only after any source-owned buffering has drained.
+    pub async fn run(self) -> Result<(), PipelineError<So::Error, Tr::Error, Si::Error>> {
+        self.run_until(std::future::pending()).await
+    }
+
+    /// Run until the source ends or `shutdown` requests an immediate source-polling cutoff.
+    ///
+    /// Records already admitted to the transform stage are drained before the final batch is
+    /// delivered and committed.
     pub async fn run_until(
         self,
         shutdown: impl Future<Output = ()> + Send,
@@ -350,6 +362,12 @@ where
     Tr: Transform<So::Payload>,
     Tr::Out: Clone + Send + 'static,
 {
+    /// Run until the source stream reaches its natural end.
+    pub async fn run(self) -> Result<(), PipelineError<So::Error, Tr::Error, ErasedError>> {
+        self.run_until(std::future::pending()).await
+    }
+
+    /// Run until the source ends or `shutdown` requests an immediate source-polling cutoff.
     pub async fn run_until(
         self,
         shutdown: impl Future<Output = ()> + Send,
@@ -446,6 +464,12 @@ where
     Tr: Transform<So::Payload>,
     Tr::Out: Send + Sync + 'static,
 {
+    /// Run until the source stream reaches its natural end.
+    pub async fn run(self) -> Result<(), PipelineError<So::Error, Tr::Error, ErasedError>> {
+        self.run_until(std::future::pending()).await
+    }
+
+    /// Run until the source ends or `shutdown` requests an immediate source-polling cutoff.
     pub async fn run_until(
         self,
         shutdown: impl Future<Output = ()> + Send,
