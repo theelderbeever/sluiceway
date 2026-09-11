@@ -40,7 +40,7 @@ kafka = [
   "dep:thiserror",
   "dep:tokio",
 ]
-kafka-sasl = ["kafka", "rdkafka/gssapi-vendored"]
+kafka-sasl = ["kafka", "rdkafka/curl-static", "rdkafka/gssapi-vendored"]
 kafka-zstd = ["kafka", "rdkafka/zstd"]
 
 [lints]
