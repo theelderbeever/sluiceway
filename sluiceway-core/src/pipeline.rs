@@ -69,57 +69,59 @@ impl BatchPolicy {
     }
 }
 
-async fn drive_batches<S, T, E, Consume, Consuming>(
-    batches: S,
-    prefetch: usize,
-    mut consume: Consume,
-) -> Result<(), E>
-where
-    S: Stream<Item = Result<Option<T>, E>>,
-    Consume: FnMut(T) -> Consuming,
-    Consuming: Future<Output = Result<(), E>>,
-{
-    tokio::pin!(batches);
+impl Batched {
+    async fn consume<S, T, E, Consume, Consuming>(
+        &self,
+        batches: S,
+        mut consume: Consume,
+    ) -> Result<(), E>
+    where
+        S: Stream<Item = Result<Option<T>, E>>,
+        Consume: FnMut(T) -> Consuming,
+        Consuming: Future<Output = Result<(), E>>,
+    {
+        tokio::pin!(batches);
 
-    if prefetch == 0 {
-        while let Some(batch) = batches.next().await {
-            if let Some(batch) = batch? {
-                consume(batch).await?;
-            }
-        }
-        return Ok(());
-    }
-
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(prefetch);
-    let producer = async move {
-        loop {
-            let Ok(permit) = sender.reserve().await else {
-                return;
-            };
-            match batches.next().await {
-                Some(Ok(Some(batch))) => permit.send(Ok(batch)),
-                Some(Ok(None)) => {}
-                Some(Err(error)) => {
-                    permit.send(Err(error));
-                    return;
+        if self.policy.prefetch == 0 {
+            while let Some(batch) = batches.next().await {
+                if let Some(batch) = batch? {
+                    consume(batch).await?;
                 }
-                None => return,
             }
+            return Ok(());
         }
-    };
-    let consumer = async move {
-        while let Some(batch) = receiver.recv().await {
-            consume(batch?).await?;
-        }
-        Ok(())
-    };
-    tokio::pin!(producer);
-    tokio::pin!(consumer);
 
-    tokio::select! {
-        biased;
-        result = &mut consumer => result,
-        () = &mut producer => consumer.await,
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(self.policy.prefetch);
+        let producer = async move {
+            loop {
+                let Ok(permit) = sender.reserve().await else {
+                    return;
+                };
+                match batches.next().await {
+                    Some(Ok(Some(batch))) => permit.send(Ok(batch)),
+                    Some(Ok(None)) => {}
+                    Some(Err(error)) => {
+                        permit.send(Err(error));
+                        return;
+                    }
+                    None => return,
+                }
+            }
+        };
+        let consumer = async move {
+            while let Some(batch) = receiver.recv().await {
+                consume(batch?).await?;
+            }
+            Ok(())
+        };
+        tokio::pin!(producer);
+        tokio::pin!(consumer);
+
+        tokio::select! {
+            biased;
+            result = &mut consumer => result,
+            () = &mut producer => consumer.await,
+        }
     }
 }
 
@@ -344,10 +346,8 @@ where
 
         let batches = chunks.map(|chunk| Batch::from_chunk(chunk, So::track));
 
-        drive_batches(
-            batches,
-            self.strategy.policy.prefetch,
-            |(batch, checkpoint)| async {
+        self.strategy
+            .consume(batches, |(batch, checkpoint)| async {
                 let reason = self.strategy.policy.emit_reason(batch.len());
                 telemetry::batch(TOPOLOGY, &pipeline_id, batch.len(), reason);
                 let delivery = {
@@ -369,9 +369,8 @@ where
                     telemetry::error(TOPOLOGY, &pipeline_id, "commit");
                     PipelineError::Commit(error)
                 })
-            },
-        )
-        .await
+            })
+            .await
     }
 }
 
@@ -496,10 +495,8 @@ where
 
         let batches = chunks.map(|chunk| Batch::from_chunk(chunk, So::track));
 
-        drive_batches(
-            batches,
-            self.strategy.policy.prefetch,
-            |(batch, checkpoint)| async {
+        self.strategy
+            .consume(batches, |(batch, checkpoint)| async {
                 let reason = self.strategy.policy.emit_reason(batch.len());
                 telemetry::batch(TOPOLOGY, &pipeline_id, batch.len(), reason);
                 let mut tasks = JoinSet::new();
@@ -538,9 +535,8 @@ where
                     telemetry::error(TOPOLOGY, &pipeline_id, "commit");
                     PipelineError::Commit(error)
                 })
-            },
-        )
-        .await
+            })
+            .await
     }
 }
 
@@ -602,10 +598,8 @@ where
 
         let batches = chunks.map(|chunk| Batch::from_chunk(chunk, So::track));
 
-        drive_batches(
-            batches,
-            self.strategy.policy.prefetch,
-            |(batch, checkpoint)| async {
+        self.strategy
+            .consume(batches, |(batch, checkpoint)| async {
                 let reason = self.strategy.policy.emit_reason(batch.len());
                 telemetry::batch(TOPOLOGY, &pipeline_id, batch.len(), reason);
                 let batch: SharedBatch<Tr::Out, So::Position> = Arc::new(batch);
@@ -636,8 +630,7 @@ where
                     telemetry::error(TOPOLOGY, &pipeline_id, "commit");
                     PipelineError::Commit(error)
                 })
-            },
-        )
-        .await
+            })
+            .await
     }
 }
