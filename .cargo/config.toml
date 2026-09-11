@@ -1,0 +1,15 @@
+# Share compiler artifacts across worktrees. Install sccache with
+# `brew install sccache` or `cargo install sccache`; bypass it with
+# `RUSTC_WRAPPER= cargo build` when needed.
+[build]
+rustc-wrapper = "sccache"
+build-dir = "{cargo-cache-home}/sluiceway-build"
+incremental = false
+
+[env]
+# Avoid leaving a daemon started from a restricted client running for later builds.
+SCCACHE_CLIENT_SIDE = "1"
+
+# Kafka builds vendored librdkafka, Cyrus SASL, and Kerberos from C/C++ sources.
+CMAKE_C_COMPILER_LAUNCHER = "sccache"
+CMAKE_CXX_COMPILER_LAUNCHER = "sccache"
