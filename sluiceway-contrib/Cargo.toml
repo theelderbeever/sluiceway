@@ -1,6 +1,6 @@
 [package]
 name = "sluiceway-contrib"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition.workspace = true
 description = "Optional source and sink integrations for Sluiceway pipelines"
 repository.workspace = true
@@ -15,8 +15,7 @@ futures-core = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 rdkafka = { workspace = true, optional = true }
 sluiceway-core = {
-  path = "../sluiceway-core",
-  version = "0.1.0-alpha.1",
+  path = "../sluiceway-core", version = "0.1.0-alpha.2",
   optional = true
 }
 thiserror = { workspace = true, optional = true }
