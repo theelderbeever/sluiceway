@@ -3,6 +3,12 @@ name: Publish crates
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -15,14 +21,14 @@ env:
 
 jobs:
   publish:
-    name: Publish ${{ github.event.release.tag_name }}
+    name: Publish ${{ github.event.release.tag_name || inputs.tag }}
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:
       contents: read
       id-token: write
     concurrency:
-      group: crates-io-${{ github.event.release.tag_name }}
+      group: crates-io-${{ github.event.release.tag_name || inputs.tag }}
       cancel-in-progress: false
     steps:
       - name: Check out released commit
@@ -30,7 +36,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
@@ -45,7 +51,7 @@ jobs:
       - name: Select and validate release
         id: release
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
 
@@ -54,6 +60,12 @@ jobs:
             echo "Release tag ${RELEASE_TAG} does not point to a commit on main" >&2
             exit 1
           fi
+
+          # Release events check out the tagged commit with a detached HEAD, but
+          # release-plz requires a current branch with an upstream. Keep HEAD on
+          # the exact released commit while giving it origin/main as its upstream.
+          git switch --create release-plz-publish
+          git branch --set-upstream-to=origin/main release-plz-publish
 
           metadata="$(cargo metadata --locked --no-deps --format-version 1)"
           shared_version="$(jq -r '.packages[] | select(.name == "sluiceway") | .version' <<<"${metadata}")"
