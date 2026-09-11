@@ -34,5 +34,7 @@ returning `None`. `run_until(shutdown)` is an explicit cutoff: it stops polling 
 future resolves, completes already admitted transforms, and flushes the partial batch.
 
 Transforms may run concurrently but their outputs remain in observed source order. Batches are
-delivered serially, and a checkpoint is committed only after successful delivery. The batch timeout
-starts when the first transformed record enters an empty batch.
+delivered serially, and a checkpoint is committed only after successful delivery. Batch prefetch
+defaults to zero; configuring `BatchPolicy::prefetch` overlaps bounded batch materialization
+with delivery and commit without changing their order. The batch timeout starts when the first
+transformed record enters an empty batch.
