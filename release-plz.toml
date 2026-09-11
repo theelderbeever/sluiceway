@@ -5,3 +5,8 @@
 changelog_update = false
 git_release_enable = false
 git_tag_enable = false
+# Keep prereleases on the current base version (for example,
+# 0.1.0-alpha.1 -> 0.1.0-alpha.2). A semver-check failure otherwise takes
+# precedence over prerelease handling and can bump the 0.x minor version.
+# Re-enable this when promoting the workspace to a stable release.
+semver_check = false
