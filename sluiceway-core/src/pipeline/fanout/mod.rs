@@ -28,7 +28,7 @@ where
     pub(super) mode: PhantomData<Mode>,
 }
 
-/// A fanout pipeline with one incremental collector session per branch.
+/// A fanout pipeline with one incremental collection per branch.
 pub struct FanoutCollectorPipeline<So, Tr, Mode, Input, St = Unset>
 where
     So: Source,

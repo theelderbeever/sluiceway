@@ -3,8 +3,8 @@ use std::{future::Future, sync::Arc};
 use futures_util::StreamExt;
 
 use crate::{
-    Batch, CollectionSession, Collector, DeliveryFailure, PipelineError, PipelineId, Record, Sink,
-    Source, Transform, telemetry,
+    Batch, Collection, Collector, DeliveryFailure, PipelineError, PipelineId, Record, Sink, Source,
+    Transform, telemetry,
 };
 
 use super::{

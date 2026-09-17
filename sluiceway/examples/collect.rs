@@ -4,9 +4,7 @@ use std::{convert::Infallible, fmt::Write as _, time::Duration};
 
 use futures_core::Stream;
 use futures_util::stream;
-use sluiceway::{
-    CollectPolicy, CollectionSession, Collector, CommitPolicy, Pipeline, Record, Source,
-};
+use sluiceway::{CollectPolicy, Collection, Collector, CommitPolicy, Pipeline, Record, Source};
 
 struct Numbers {
     end: u64,
@@ -53,7 +51,7 @@ impl Collector<Record<u64, u64>> for Ndjson {
     }
 }
 
-impl CollectionSession<Record<u64, u64>> for NdjsonSession {
+impl Collection<Record<u64, u64>> for NdjsonSession {
     type Error = std::fmt::Error;
 
     async fn push(&mut self, record: Record<u64, u64>) -> Result<(), Self::Error> {

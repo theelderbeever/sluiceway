@@ -35,9 +35,9 @@ future resolves, completes already admitted transforms, and flushes the partial 
 
 Transforms may run concurrently but their outputs remain in observed source order. Sinks may consume
 individual records with `.each()`, materialized batches with `.batched(...)`, or incremental
-batch-scoped sessions with `.collect(...)`. Collection shape is independent from `CommitPolicy`, so
-successfully delivered records can be committed after every acknowledgement, after a record count,
-or after a count-or-time threshold.
+batch-scoped `Collection`s with `.collect(...)`. Collection shape is independent from
+`CommitPolicy`, so successfully delivered records can be committed after every acknowledgement,
+after a record count, or after a count-or-time threshold.
 
 Commit policies operate at acknowledged delivery boundaries:
 
@@ -45,7 +45,7 @@ Commit policies operate at acknowledged delivery boundaries:
 | --- | --- | --- |
 | `.each()` | The record sink returns success | The current record finishes, then pending progress is committed |
 | `.batched(...)` | The whole batch sink returns success | The in-flight batch finishes, then pending progress, including that batch, is committed |
-| `.collect(...)` | The session's `finish()` returns success | The in-flight session finishes, then pending progress, including that collection, is committed |
+| `.collect(...)` | The `Collection`'s `finish()` returns success | The in-flight collection finishes, then pending progress, including that collection, is committed |
 
 For fanout, acknowledgement requires every branch to succeed. A commit timeout starts with the
 first successful acknowledgement after the preceding commit. It is a maximum idle wait at a safe

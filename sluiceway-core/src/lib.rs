@@ -1,8 +1,8 @@
 //! Typed, ordered linear and fanout pipeline runners.
 //!
 //! One consuming transform feeds either a single owned sink or a type-erased fanout of sinks.
-//! Records may be delivered individually, as materialized batches, or through incremental collector
-//! sessions. Collection shape and checkpoint cadence are configured independently while preserving
+//! Records may be delivered individually, as materialized batches, or through incremental
+//! [`Collection`]s. Collection shape and checkpoint cadence are configured independently while preserving
 //! at-least-once delivery.
 //!
 //! Pipelines cannot run until a delivery topology and collection shape are configured:
@@ -41,9 +41,8 @@ pub use pipeline::{
 };
 pub use record::Record;
 pub use sink::{
-    Batch, BoxCollector, BoxRecordSink, BoxSink, BoxedCollector, BoxedSink, Cloned,
-    CollectionSession, Collector, FanoutMode, FanoutRecordMode, Shared, SharedBatch, SharedRecord,
-    Sink,
+    Batch, BoxCollector, BoxRecordSink, BoxSink, BoxedCollector, BoxedSink, Cloned, Collection,
+    Collector, FanoutMode, FanoutRecordMode, Shared, SharedBatch, SharedRecord, Sink,
 };
 pub use source::Source;
 pub use transform::{Identity, Transform, Transformer};

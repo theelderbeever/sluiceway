@@ -30,7 +30,7 @@ pub struct Collected {
 ///
 /// A commit policy is evaluated only after a delivery unit has been durably acknowledged. A
 /// delivery unit is one record for [`Each`], one complete batch for [`Batched`], or one collector
-/// session whose [`crate::CollectionSession::finish`] call succeeded for [`Collected`]. Fanout
+/// [`crate::Collection`] whose [`crate::Collection::finish`] call succeeded for [`Collected`]. Fanout
 /// acknowledges the unit only after every branch succeeds.
 ///
 /// A timeout starts with the first acknowledgement after the previous commit. It is not a
@@ -80,7 +80,7 @@ impl CommitPolicy {
     }
 }
 
-/// Validated limits for an incremental collector session.
+/// Validated limits for an incremental collection.
 #[derive(Debug, Clone, Copy)]
 pub struct CollectPolicy {
     size: NonZeroUsize,

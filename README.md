@@ -93,8 +93,8 @@ Individual source records carry message-local positions. Transforms receive an i
 reference alongside each owned payload, and the resulting records retain those positions through
 delivery. Collection and checkpoint cadence are independent: `.each()` delivers `Record<T, P>`
 values individually, `.batched(...)` delivers materialized `Batch<T, P>` values, and
-`.collect(...)` pushes records into an incremental `Collector` session before acknowledging the
-collection with `finish()`. `CommitPolicy::each()`, `after(records)`, and
+`.collect(...)` uses a `Collector` to open an incremental `Collection`, pushes records into it, and
+acknowledges the collection when `finish()` succeeds. `CommitPolicy::each()`, `after(records)`, and
 `after_or_timeout(records, timeout)` control when the successfully delivered frontier is persisted.
 Checkpoint persistence remains source-owned through `CheckpointStore<C>`.
 
@@ -104,7 +104,7 @@ Commit timing follows delivery acknowledgements rather than interrupting deliver
 | --- | --- | --- |
 | `.each()` | One successful record delivery | Commit after that record completes |
 | `.batched(...)` | One successful whole-batch delivery | Commit after that batch completes |
-| `.collect(...)` | A successful collector `finish()` | Commit after that collector session completes |
+| `.collect(...)` | A `Collection` successfully finishes | Commit after that collection completes |
 
 Fanout reaches the boundary only after every branch succeeds. The commit timer starts with the
 first acknowledgement after the previous commit, and a passed deadline includes the newly

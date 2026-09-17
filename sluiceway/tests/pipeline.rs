@@ -14,7 +14,7 @@ use std::{
 use futures_core::Stream;
 use futures_util::{StreamExt, stream};
 use sluiceway::{
-    Batch, BatchPolicy, BoxSink, CheckpointStore, CollectPolicy, CollectionSession, Collector,
+    Batch, BatchPolicy, BoxSink, CheckpointStore, CollectPolicy, Collection, Collector,
     CommitPolicy, DeliveryFailure, Identity, NoCheckpoint, Pipeline, PipelineError, PipelineId,
     Record, SharedBatch, Sink, Source, Transformer,
 };
@@ -189,7 +189,7 @@ impl Collector<Record<u64, Cursor>> for VecCollector {
     }
 }
 
-impl CollectionSession<Record<u64, Cursor>> for VecSession {
+impl Collection<Record<u64, Cursor>> for VecSession {
     type Error = Infallible;
 
     async fn push(&mut self, record: Record<u64, Cursor>) -> Result<(), Self::Error> {
@@ -215,7 +215,7 @@ impl Collector<Arc<Record<u64, Cursor>>> for VecCollector {
     }
 }
 
-impl CollectionSession<Arc<Record<u64, Cursor>>> for VecSession {
+impl Collection<Arc<Record<u64, Cursor>>> for VecSession {
     type Error = Infallible;
 
     async fn push(&mut self, record: Arc<Record<u64, Cursor>>) -> Result<(), Self::Error> {

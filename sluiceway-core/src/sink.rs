@@ -85,23 +85,23 @@ pub trait Sink<Input: Send>: Send + Sync {
     fn deliver(&self, input: Input) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-/// Opens batch-scoped sessions that consume records incrementally.
+/// Opens batch-scoped [`Collection`]s that consume records incrementally.
 ///
 /// Naturally synchronous setup can run directly inside an `async fn` implementation or be wrapped
 /// with [`std::future::ready`]. Sluiceway never moves collector work to a blocking thread
 /// implicitly; implementations that need a blocking pool must opt into one themselves.
 pub trait Collector<Input: Send>: Send + Sync {
-    type Session: CollectionSession<Input, Error = Self::Error>;
+    type Session: Collection<Input, Error = Self::Error>;
     type Error: std::error::Error + Send + Sync + 'static;
 
     fn begin(&self) -> impl Future<Output = Result<Self::Session, Self::Error>> + Send;
 }
 
-/// One incrementally populated, batch-scoped collector session.
+/// An incrementally populated, batch-scoped collection.
 ///
 /// Synchronous encoding, compression, and in-memory writes may run directly in `push` or `finish`;
 /// an implementation does not need a separate synchronous adapter trait.
-pub trait CollectionSession<Input: Send>: Send {
+pub trait Collection<Input: Send>: Send {
     type Error: std::error::Error + Send + Sync + 'static;
 
     fn push(&mut self, input: Input) -> impl Future<Output = Result<(), Self::Error>> + Send;
@@ -116,36 +116,32 @@ trait ErasedSink<Input>: Send + Sync {
     fn deliver(&self, input: Input) -> BoxFuture<'_, Result<(), ErasedError>>;
 }
 
-trait ErasedCollectionSession<Input>: Send {
+trait ErasedCollection<Input>: Send {
     fn push(&mut self, input: Input) -> BoxFuture<'_, Result<(), ErasedError>>;
     fn finish(self: Box<Self>) -> BoxFuture<'static, Result<(), ErasedError>>;
 }
 
-impl<Input, S> ErasedCollectionSession<Input> for S
+impl<Input, S> ErasedCollection<Input> for S
 where
     Input: Send + 'static,
-    S: CollectionSession<Input> + 'static,
+    S: Collection<Input> + 'static,
 {
     fn push(&mut self, input: Input) -> BoxFuture<'_, Result<(), ErasedError>> {
         Box::pin(async move {
-            CollectionSession::push(self, input)
+            Collection::push(self, input)
                 .await
                 .map_err(ErasedError::new)
         })
     }
 
     fn finish(self: Box<Self>) -> BoxFuture<'static, Result<(), ErasedError>> {
-        Box::pin(async move {
-            CollectionSession::finish(*self)
-                .await
-                .map_err(ErasedError::new)
-        })
+        Box::pin(async move { Collection::finish(*self).await.map_err(ErasedError::new) })
     }
 }
 
-pub(crate) struct BoxedCollectionSession<Input>(Box<dyn ErasedCollectionSession<Input>>);
+pub(crate) struct BoxedCollection<Input>(Box<dyn ErasedCollection<Input>>);
 
-impl<Input: Send + 'static> BoxedCollectionSession<Input> {
+impl<Input: Send + 'static> BoxedCollection<Input> {
     pub(crate) async fn push(&mut self, input: Input) -> Result<(), ErasedError> {
         self.0.push(input).await
     }
@@ -156,7 +152,7 @@ impl<Input: Send + 'static> BoxedCollectionSession<Input> {
 }
 
 trait ErasedCollector<Input>: Send + Sync {
-    fn begin(&self) -> BoxFuture<'_, Result<BoxedCollectionSession<Input>, ErasedError>>;
+    fn begin(&self) -> BoxFuture<'_, Result<BoxedCollection<Input>, ErasedError>>;
 }
 
 impl<Input, C> ErasedCollector<Input> for C
@@ -165,17 +161,17 @@ where
     C: Collector<Input> + 'static,
     C::Session: 'static,
 {
-    fn begin(&self) -> BoxFuture<'_, Result<BoxedCollectionSession<Input>, ErasedError>> {
+    fn begin(&self) -> BoxFuture<'_, Result<BoxedCollection<Input>, ErasedError>> {
         Box::pin(async move {
             Collector::begin(self)
                 .await
-                .map(|session| BoxedCollectionSession(Box::new(session)))
+                .map(|session| BoxedCollection(Box::new(session)))
                 .map_err(ErasedError::new)
         })
     }
 }
 
-/// A collector whose concrete session and error types have been erased for fanout delivery.
+/// A collector whose concrete collection and error types have been erased for fanout delivery.
 pub struct BoxedCollector<Input> {
     inner: Arc<dyn ErasedCollector<Input>>,
 }
@@ -199,7 +195,7 @@ impl<Input: Send + 'static> BoxedCollector<Input> {
         }
     }
 
-    pub(crate) async fn begin(&self) -> Result<BoxedCollectionSession<Input>, ErasedError> {
+    pub(crate) async fn begin(&self) -> Result<BoxedCollection<Input>, ErasedError> {
         self.inner.begin().await
     }
 }
