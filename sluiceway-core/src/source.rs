@@ -13,7 +13,7 @@ pub trait Source: Send + Sync {
     type Payload: Send;
     /// Message-local source position carried through transformation and delivery.
     type Position: Send + Sync + 'static;
-    /// Batch-level progress committed after successful delivery.
+    /// Progress accumulated between successful commits.
     type Checkpoint: Send + Sync + 'static;
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -21,15 +21,14 @@ pub trait Source: Send + Sync {
         &self,
     ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_;
 
-    /// Fold one message position into the checkpoint for its batch.
+    /// Fold one message position into the checkpoint pending its next commit.
     ///
-    /// The runner calls this exactly once per successfully transformed record, in source order.
-    /// `checkpoint` is `None` for the first record in each batch. Implementations can select the
-    /// final position, aggregate partition positions, or apply other source-specific checkpoint
-    /// semantics.
+    /// The runner calls this as records enter an ordered sink-delivery attempt. `checkpoint` is
+    /// `None` for the first record after a commit. Implementations can select the final position,
+    /// aggregate partition positions, or apply other source-specific checkpoint semantics.
     fn track(checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint;
 
-    /// Commit a successfully delivered batch checkpoint.
+    /// Commit a successfully delivered checkpoint frontier.
     ///
     /// The source may translate this checkpoint before persisting it, for example to retain a
     /// replay window. The pipeline deliberately does not access checkpoint storage directly.

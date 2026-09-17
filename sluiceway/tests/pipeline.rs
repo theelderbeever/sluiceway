@@ -14,8 +14,9 @@ use std::{
 use futures_core::Stream;
 use futures_util::{StreamExt, stream};
 use sluiceway::{
-    Batch, BatchPolicy, BoxSink, CheckpointStore, DeliveryFailure, Identity, NoCheckpoint,
-    Pipeline, PipelineError, PipelineId, Record, SharedBatch, Sink, Source, Transformer,
+    Batch, BatchPolicy, BoxSink, CheckpointStore, CollectPolicy, CollectionSession, Collector,
+    CommitPolicy, DeliveryFailure, Identity, NoCheckpoint, Pipeline, PipelineError, PipelineId,
+    Record, SharedBatch, Sink, Source, Transformer,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +151,244 @@ fn acknowledge(ack: Ack) -> Result<(), TestSinkError> {
         Ack::Exact => Ok(()),
         Ack::Fail => Err(TestSinkError),
     }
+}
+
+#[derive(Clone)]
+struct RecordCollector {
+    records: Arc<Mutex<Vec<u64>>>,
+}
+
+impl Sink<Record<u64, Cursor>> for RecordCollector {
+    type Error = Infallible;
+
+    async fn deliver(&self, record: Record<u64, Cursor>) -> Result<(), Self::Error> {
+        self.records.lock().unwrap().push(record.payload);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct VecCollector {
+    collections: Arc<Mutex<Vec<Vec<u64>>>>,
+}
+
+struct VecSession {
+    records: Vec<u64>,
+    collections: Arc<Mutex<Vec<Vec<u64>>>>,
+}
+
+impl Collector<Record<u64, Cursor>> for VecCollector {
+    type Session = VecSession;
+    type Error = Infallible;
+
+    async fn begin(&self) -> Result<Self::Session, Self::Error> {
+        Ok(VecSession {
+            records: Vec::new(),
+            collections: Arc::clone(&self.collections),
+        })
+    }
+}
+
+impl CollectionSession<Record<u64, Cursor>> for VecSession {
+    type Error = Infallible;
+
+    async fn push(&mut self, record: Record<u64, Cursor>) -> Result<(), Self::Error> {
+        self.records.push(record.payload);
+        Ok(())
+    }
+
+    async fn finish(self) -> Result<(), Self::Error> {
+        self.collections.lock().unwrap().push(self.records);
+        Ok(())
+    }
+}
+
+impl Collector<Arc<Record<u64, Cursor>>> for VecCollector {
+    type Session = VecSession;
+    type Error = Infallible;
+
+    async fn begin(&self) -> Result<Self::Session, Self::Error> {
+        Ok(VecSession {
+            records: Vec::new(),
+            collections: Arc::clone(&self.collections),
+        })
+    }
+}
+
+impl CollectionSession<Arc<Record<u64, Cursor>>> for VecSession {
+    type Error = Infallible;
+
+    async fn push(&mut self, record: Arc<Record<u64, Cursor>>) -> Result<(), Self::Error> {
+        self.records.push(record.payload);
+        Ok(())
+    }
+
+    async fn finish(self) -> Result<(), Self::Error> {
+        self.collections.lock().unwrap().push(self.records);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct SharedRecordCollector(Arc<Mutex<Vec<u64>>>);
+
+impl Sink<Arc<Record<u64, Cursor>>> for SharedRecordCollector {
+    type Error = Infallible;
+
+    async fn deliver(&self, record: Arc<Record<u64, Cursor>>) -> Result<(), Self::Error> {
+        self.0.lock().unwrap().push(record.payload);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn each_delivery_is_independent_from_commit_cadence() {
+    let (source, committed) = source(vec![10, 20, 30, 40, 50]);
+    let records = Arc::new(Mutex::new(Vec::new()));
+
+    Pipeline::source(source)
+        .transform(Identity)
+        .sink(RecordCollector {
+            records: Arc::clone(&records),
+        })
+        .each()
+        .commit_policy(CommitPolicy::after(2).unwrap())
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(*records.lock().unwrap(), vec![10, 20, 30, 40, 50]);
+    assert_eq!(
+        *committed.lock().unwrap(),
+        vec![Cursor::at(1), Cursor::at(3), Cursor::at(4)]
+    );
+}
+
+#[tokio::test]
+async fn commit_timeout_fires_while_each_sink_waits_for_input() {
+    let committed = Arc::new(Mutex::new(Vec::new()));
+    let source = OpenSource {
+        committed: Arc::clone(&committed),
+    };
+    let records = Arc::new(Mutex::new(Vec::new()));
+
+    Pipeline::source(source)
+        .transform(Identity)
+        .sink(RecordCollector { records })
+        .each()
+        .commit_policy(CommitPolicy::after_or_timeout(100, Duration::from_millis(5)).unwrap())
+        .run_until(tokio::time::sleep(Duration::from_millis(20)))
+        .await
+        .unwrap();
+
+    assert_eq!(*committed.lock().unwrap(), vec![Cursor::at(0)]);
+}
+
+#[tokio::test]
+async fn commit_timeout_fires_while_batch_sink_waits_for_input() {
+    let committed = Arc::new(Mutex::new(Vec::new()));
+    let source = OpenSource {
+        committed: Arc::clone(&committed),
+    };
+    let (sink, _) = linear_collector(Ack::Exact);
+
+    Pipeline::source(source)
+        .transform(Identity)
+        .sink(sink)
+        .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
+        .commit_policy(CommitPolicy::after_or_timeout(100, Duration::from_millis(5)).unwrap())
+        .run_until(tokio::time::sleep(Duration::from_millis(20)))
+        .await
+        .unwrap();
+
+    assert_eq!(*committed.lock().unwrap(), vec![Cursor::at(0)]);
+}
+
+#[tokio::test]
+async fn collector_processes_eagerly_and_acknowledges_on_finish() {
+    let (source, committed) = source(vec![1, 2, 3, 4, 5]);
+    let collections = Arc::new(Mutex::new(Vec::new()));
+
+    Pipeline::source(source)
+        .transform(Identity)
+        .sink(VecCollector {
+            collections: Arc::clone(&collections),
+        })
+        .collect(CollectPolicy::try_new(2, Duration::from_secs(1)).unwrap())
+        .commit_policy(CommitPolicy::after(3).unwrap())
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *collections.lock().unwrap(),
+        vec![vec![1, 2], vec![3, 4], vec![5]]
+    );
+    assert_eq!(
+        *committed.lock().unwrap(),
+        vec![Cursor::at(3), Cursor::at(4)]
+    );
+}
+
+#[tokio::test]
+async fn shared_fanout_supports_each_delivery() {
+    let (source, committed) = source(vec![1, 2, 3]);
+    let first = Arc::new(Mutex::new(Vec::new()));
+    let second = Arc::new(Mutex::new(Vec::new()));
+
+    Pipeline::source(source)
+        .transform(Identity)
+        .fanout()
+        .shared()
+        .sinks([
+            SharedRecordCollector(Arc::clone(&first)).into(),
+            SharedRecordCollector(Arc::clone(&second)).into(),
+        ])
+        .each()
+        .commit_policy(CommitPolicy::after(2).unwrap())
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(*first.lock().unwrap(), vec![1, 2, 3]);
+    assert_eq!(*second.lock().unwrap(), vec![1, 2, 3]);
+    assert_eq!(
+        *committed.lock().unwrap(),
+        vec![Cursor::at(1), Cursor::at(2)]
+    );
+}
+
+#[tokio::test]
+async fn shared_fanout_supports_incremental_collectors() {
+    let (source, committed) = source(vec![1, 2, 3]);
+    let first = Arc::new(Mutex::new(Vec::new()));
+    let second = Arc::new(Mutex::new(Vec::new()));
+
+    Pipeline::source(source)
+        .transform(Identity)
+        .fanout()
+        .shared()
+        .collectors([
+            VecCollector {
+                collections: Arc::clone(&first),
+            }
+            .into(),
+            VecCollector {
+                collections: Arc::clone(&second),
+            }
+            .into(),
+        ])
+        .collect(CollectPolicy::try_new(2, Duration::from_secs(1)).unwrap())
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(*first.lock().unwrap(), vec![vec![1, 2], vec![3]]);
+    assert_eq!(*second.lock().unwrap(), vec![vec![1, 2], vec![3]]);
+    assert_eq!(
+        *committed.lock().unwrap(),
+        vec![Cursor::at(1), Cursor::at(2)]
+    );
 }
 
 struct CountingSink {
@@ -691,7 +930,7 @@ async fn no_checkpoint_store_accepts_a_custom_checkpoint_type() {
 }
 
 #[test]
-fn batching_rejects_zero_bounds() {
+fn collection_and_commit_policies_reject_zero_bounds() {
     assert!(matches!(
         BatchPolicy::try_new(0, Duration::from_secs(1)),
         Err(sluiceway::BatchConfigError::ZeroSize)
@@ -699,6 +938,22 @@ fn batching_rejects_zero_bounds() {
     assert!(matches!(
         BatchPolicy::try_new(1, Duration::ZERO),
         Err(sluiceway::BatchConfigError::ZeroTimeout)
+    ));
+    assert!(matches!(
+        CollectPolicy::try_new(0, Duration::from_secs(1)),
+        Err(sluiceway::CollectConfigError::ZeroSize)
+    ));
+    assert!(matches!(
+        CollectPolicy::try_new(1, Duration::ZERO),
+        Err(sluiceway::CollectConfigError::ZeroTimeout)
+    ));
+    assert!(matches!(
+        CommitPolicy::after(0),
+        Err(sluiceway::CommitConfigError::ZeroRecords)
+    ));
+    assert!(matches!(
+        CommitPolicy::after_or_timeout(1, Duration::ZERO),
+        Err(sluiceway::CommitConfigError::ZeroTimeout)
     ));
 }
 

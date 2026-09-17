@@ -44,6 +44,24 @@ pub enum BatchConfigError {
     ZeroTimeout,
 }
 
+/// Invalid collection configuration rejected before a pipeline can run.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum CollectConfigError {
+    #[error("collection size must be greater than zero")]
+    ZeroSize,
+    #[error("collection timeout must be greater than zero")]
+    ZeroTimeout,
+}
+
+/// Invalid checkpoint commit configuration.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum CommitConfigError {
+    #[error("commit record count must be greater than zero")]
+    ZeroRecords,
+    #[error("commit timeout must be greater than zero")]
+    ZeroTimeout,
+}
+
 /// A sink delivery failure without branch names, indexes, or runner metadata.
 #[derive(Debug, Error)]
 pub enum DeliveryFailure<E>

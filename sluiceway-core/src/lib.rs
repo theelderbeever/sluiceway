@@ -1,10 +1,11 @@
 //! Typed, ordered linear and fanout pipeline runners.
 //!
-//! One consuming transform feeds either a single owned sink or a type-erased fanout of sinks. A
-//! source folds message positions into one checkpoint per batch, which is committed only after every
-//! sink succeeds, providing at-least-once delivery.
+//! One consuming transform feeds either a single owned sink or a type-erased fanout of sinks.
+//! Records may be delivered individually, as materialized batches, or through incremental collector
+//! sessions. Collection shape and checkpoint cadence are configured independently while preserving
+//! at-least-once delivery.
 //!
-//! Pipelines cannot run until a delivery topology and batch policy are configured:
+//! Pipelines cannot run until a delivery topology and collection shape are configured:
 //!
 //! ```compile_fail
 //! # use sluiceway_core::{Identity, Pipeline};
@@ -29,12 +30,20 @@ mod telemetry;
 mod transform;
 
 pub use checkpoint::{CheckpointStore, NoCheckpoint};
-pub use error::{BatchConfigError, DeliveryFailure, ErasedError, PipelineError};
+pub use error::{
+    BatchConfigError, CollectConfigError, CommitConfigError, DeliveryFailure, ErasedError,
+    PipelineError,
+};
 pub use identity::{PipelineId, PipelineIdError};
 pub use pipeline::{
-    BatchPolicy, Batched, FanoutBuilder, FanoutPipeline, LinearPipeline, Pipeline, Unset,
+    BatchPolicy, Batched, CollectPolicy, Collected, CommitPolicy, Each, FanoutBuilder,
+    FanoutCollectorPipeline, FanoutPipeline, LinearPipeline, Pipeline, Unset,
 };
 pub use record::Record;
-pub use sink::{Batch, BoxSink, Cloned, FanoutMode, Shared, SharedBatch, Sink};
+pub use sink::{
+    Batch, BoxCollector, BoxRecordSink, BoxSink, BoxedCollector, BoxedSink, Cloned,
+    CollectionSession, Collector, FanoutMode, FanoutRecordMode, Shared, SharedBatch, SharedRecord,
+    Sink,
+};
 pub use source::Source;
 pub use transform::{Identity, Transform, Transformer};

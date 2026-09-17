@@ -17,6 +17,8 @@ Runnable linear and shared-fanout examples live under `sluiceway/examples`:
 ```shell
 cargo run -p sluiceway --example linear
 cargo run -p sluiceway --example shared
+cargo run -p sluiceway --example each
+cargo run -p sluiceway --example collect
 ```
 
 ## Packages
@@ -89,7 +91,11 @@ every sink succeeds.
 
 Individual source records carry message-local positions. Transforms receive an immutable position
 reference alongside each owned payload, and the resulting records retain those positions through
-delivery. When a batch closes, the source also folds the positions into an internal batch checkpoint.
+delivery. Collection and checkpoint cadence are independent: `.each()` delivers `Record<T, P>`
+values individually, `.batched(...)` delivers materialized `Batch<T, P>` values, and
+`.collect(...)` pushes records into an incremental `Collector` session before acknowledging the
+collection with `finish()`. `CommitPolicy::each()`, `after(records)`, and
+`after_or_timeout(records, timeout)` control when the successfully delivered frontier is persisted.
 Checkpoint persistence remains source-owned through `CheckpointStore<C>`.
 
 `run()` consumes through the source stream's natural end. Sources that own graceful shutdown

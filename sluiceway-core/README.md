@@ -33,8 +33,11 @@ observing a signal in `Source::stream`, stopping intake, draining its internal b
 returning `None`. `run_until(shutdown)` is an explicit cutoff: it stops polling the source when the
 future resolves, completes already admitted transforms, and flushes the partial batch.
 
-Transforms may run concurrently but their outputs remain in observed source order. Batches are
-delivered serially, and a checkpoint is committed only after successful delivery. Batch prefetch
+Transforms may run concurrently but their outputs remain in observed source order. Sinks may consume
+individual records with `.each()`, materialized batches with `.batched(...)`, or incremental
+batch-scoped sessions with `.collect(...)`. Collection shape is independent from `CommitPolicy`, so
+successfully delivered records can be committed after every acknowledgement, after a record count,
+or after a count-or-time threshold. Batch prefetch
 defaults to zero; configuring `BatchPolicy::prefetch` overlaps bounded batch materialization
 with delivery and commit without changing their order. The batch timeout starts when the first
 transformed record enters an empty batch.
