@@ -33,8 +33,28 @@ observing a signal in `Source::stream`, stopping intake, draining its internal b
 returning `None`. `run_until(shutdown)` is an explicit cutoff: it stops polling the source when the
 future resolves, completes already admitted transforms, and flushes the partial batch.
 
-Transforms may run concurrently but their outputs remain in observed source order. Batches are
-delivered serially, and a checkpoint is committed only after successful delivery. Batch prefetch
-defaults to zero; configuring `BatchPolicy::prefetch` overlaps bounded batch materialization
-with delivery and commit without changing their order. The batch timeout starts when the first
-transformed record enters an empty batch.
+Transforms may run concurrently but their outputs remain in observed source order. Sinks may consume
+individual records with `.each()`, materialized batches with `.batched(...)`, or incremental
+batch-scoped `Collection`s with `.collect(...)`. Collection shape is independent from
+`CommitPolicy`, so successfully delivered records can be committed after every acknowledgement,
+after a record count, or after a count-or-time threshold.
+
+Commit policies operate at acknowledged delivery boundaries:
+
+| Collection shape | Acknowledged after | Effect of a passed commit deadline |
+| --- | --- | --- |
+| `.each()` | The record sink returns success | The current record finishes, then pending progress is committed |
+| `.batched(...)` | The whole batch sink returns success | The in-flight batch finishes, then pending progress, including that batch, is committed |
+| `.collect(...)` | The `Collection`'s `finish()` returns success | The in-flight collection finishes, then pending progress, including that collection, is committed |
+
+For fanout, acknowledgement requires every branch to succeed. A commit timeout starts with the
+first successful acknowledgement after the preceding commit. It is a maximum idle wait at a safe
+boundary, not a cancellation deadline, so slow sink work can extend the elapsed time between
+commits. Collection and batch timeouts only decide when to close their respective delivery unit;
+they likewise do not interrupt an in-progress sink method. Clean EOF or graceful shutdown commits
+remaining acknowledged progress, while a delivery failure does not trigger an opportunistic
+commit.
+
+Batch prefetch defaults to zero; configuring `BatchPolicy::prefetch` overlaps bounded batch
+materialization with delivery and commit without changing their order. The batch timeout starts
+when the first transformed record enters an empty batch.
