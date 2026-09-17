@@ -98,6 +98,21 @@ collection with `finish()`. `CommitPolicy::each()`, `after(records)`, and
 `after_or_timeout(records, timeout)` control when the successfully delivered frontier is persisted.
 Checkpoint persistence remains source-owned through `CheckpointStore<C>`.
 
+Commit timing follows delivery acknowledgements rather than interrupting delivery:
+
+| Sink shape | Acknowledgement boundary | If the commit deadline passes in flight |
+| --- | --- | --- |
+| `.each()` | One successful record delivery | Commit after that record completes |
+| `.batched(...)` | One successful whole-batch delivery | Commit after that batch completes |
+| `.collect(...)` | A successful collector `finish()` | Commit after that collector session completes |
+
+Fanout reaches the boundary only after every branch succeeds. The commit timer starts with the
+first acknowledgement after the previous commit, and a passed deadline includes the newly
+acknowledged unit in the committed frontier. Thus the timeout bounds waiting only while the runner
+is at a safe boundary; it cannot bound a slow sink call. Clean EOF or graceful shutdown commits
+remaining acknowledged progress. A failed delivery is not acknowledged and does not cause an
+opportunistic commit.
+
 `run()` consumes through the source stream's natural end. Sources that own graceful shutdown
 should observe their configured signal inside `Source::stream`, stop external intake, drain any
 source-owned buffer, and then return `None`. `run_until(shutdown)` instead imposes a cutoff on

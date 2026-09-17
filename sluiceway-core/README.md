@@ -37,7 +37,24 @@ Transforms may run concurrently but their outputs remain in observed source orde
 individual records with `.each()`, materialized batches with `.batched(...)`, or incremental
 batch-scoped sessions with `.collect(...)`. Collection shape is independent from `CommitPolicy`, so
 successfully delivered records can be committed after every acknowledgement, after a record count,
-or after a count-or-time threshold. Batch prefetch
-defaults to zero; configuring `BatchPolicy::prefetch` overlaps bounded batch materialization
-with delivery and commit without changing their order. The batch timeout starts when the first
-transformed record enters an empty batch.
+or after a count-or-time threshold.
+
+Commit policies operate at acknowledged delivery boundaries:
+
+| Collection shape | Acknowledged after | Effect of a passed commit deadline |
+| --- | --- | --- |
+| `.each()` | The record sink returns success | The current record finishes, then pending progress is committed |
+| `.batched(...)` | The whole batch sink returns success | The in-flight batch finishes, then pending progress, including that batch, is committed |
+| `.collect(...)` | The session's `finish()` returns success | The in-flight session finishes, then pending progress, including that collection, is committed |
+
+For fanout, acknowledgement requires every branch to succeed. A commit timeout starts with the
+first successful acknowledgement after the preceding commit. It is a maximum idle wait at a safe
+boundary, not a cancellation deadline, so slow sink work can extend the elapsed time between
+commits. Collection and batch timeouts only decide when to close their respective delivery unit;
+they likewise do not interrupt an in-progress sink method. Clean EOF or graceful shutdown commits
+remaining acknowledged progress, while a delivery failure does not trigger an opportunistic
+commit.
+
+Batch prefetch defaults to zero; configuring `BatchPolicy::prefetch` overlaps bounded batch
+materialization with delivery and commit without changing their order. The batch timeout starts
+when the first transformed record enters an empty batch.

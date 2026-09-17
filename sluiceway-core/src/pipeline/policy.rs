@@ -27,6 +27,19 @@ pub struct Collected {
 }
 
 /// Controls when successfully delivered source progress is committed.
+///
+/// A commit policy is evaluated only after a delivery unit has been durably acknowledged. A
+/// delivery unit is one record for [`Each`], one complete batch for [`Batched`], or one collector
+/// session whose [`crate::CollectionSession::finish`] call succeeded for [`Collected`]. Fanout
+/// acknowledges the unit only after every branch succeeds.
+///
+/// A timeout starts with the first acknowledgement after the previous commit. It is not a
+/// cancellation deadline: if it expires while a sink or collector is running, that operation is
+/// allowed to finish and the commit occurs at the next safe boundary. Consequently, a slow
+/// operation can make the elapsed time between commits longer than the configured timeout.
+/// Clean EOF and graceful shutdown commit any remaining acknowledged progress regardless of the
+/// configured count. A failed delivery is not acknowledged and does not cause an opportunistic
+/// commit.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CommitPolicy {
     records: Option<NonZeroUsize>,
@@ -51,7 +64,10 @@ impl CommitPolicy {
         })
     }
 
-    /// Commit after `records` acknowledgements or `timeout`, whichever is reached first.
+    /// Commit after `records` acknowledged source records or `timeout`, whichever is reached first.
+    ///
+    /// The timer begins when the first delivery unit after a commit is acknowledged. Expiration is
+    /// observed between delivery units and never interrupts an in-flight sink or collector.
     pub fn after_or_timeout(records: usize, timeout: Duration) -> Result<Self, CommitConfigError> {
         let records = NonZeroUsize::new(records).ok_or(CommitConfigError::ZeroRecords)?;
         if timeout.is_zero() {
