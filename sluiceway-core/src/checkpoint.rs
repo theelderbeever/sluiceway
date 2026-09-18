@@ -8,7 +8,10 @@ pub trait CheckpointStore<Cp: Sync>: Send + Sync {
     fn save(&self, checkpoint: &Cp) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-/// Checkpoint implementation used when persistence is disabled.
+/// No-op checkpoint storage used when persistence is disabled.
+///
+/// This is a [`CheckpointStore`], not a checkpoint representation implementing
+/// [`crate::Checkpoint`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoCheckpoint;
 

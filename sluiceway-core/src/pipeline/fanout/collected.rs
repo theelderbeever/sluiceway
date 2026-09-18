@@ -9,7 +9,10 @@ use crate::{
 };
 
 use super::FanoutCollectorPipeline;
-use crate::pipeline::{Collected, policy::CommitState};
+use crate::pipeline::{
+    Collected, CommitPolicy,
+    policy::{CommitState, commit_eligible},
+};
 
 enum Deadline<T> {
     Ready(T),
@@ -84,12 +87,13 @@ async fn finish_collections<Input: Send + 'static>(
     }
 }
 
-impl<So, Tr> FanoutCollectorPipeline<So, Tr, Cloned, Record<Tr::Out, So::Position>, Collected>
+impl<So, Tr, C> FanoutCollectorPipeline<So, Tr, Cloned, Record<Tr::Out, So::Position>, Collected<C>>
 where
     So: Source,
     Tr: Transform<So::Payload, So::Position>,
     Tr::Out: Clone + Send + 'static,
     So::Position: Clone,
+    C: CommitPolicy<So::Position>,
 {
     const TOPOLOGY: &str = "fanout_cloned";
     pub async fn run(self) -> Result<(), PipelineError<So::Error, Tr::Error, ErasedError>> {
@@ -120,14 +124,14 @@ where
             })
             .buffered(transform.max_concurrency().get());
         tokio::pin!(records);
-        let mut commits = CommitState::new(self.strategy.commit);
+        let mut commits = CommitState::new(self.strategy.commit_policy);
 
         loop {
             let first = match next_or_commit_deadline(records.next(), commits.deadline()).await {
                 Deadline::Ready(first) => first,
                 Deadline::Elapsed => {
-                    commits
-                        .commit(&self.source)
+                    commits.handle_timeout();
+                    commit_eligible(&mut commits, &self.source)
                         .await
                         .map_err(PipelineError::Commit)?;
                     telemetry::commit(Self::TOPOLOGY, &pipeline_id, true);
@@ -147,7 +151,7 @@ where
             let mut ended = false;
             loop {
                 if let Some(record) = current.take() {
-                    commits.track::<So>(record.position());
+                    commits.track(record.position());
                     let inputs = (0..collections.len())
                         .map(|_| record.clone())
                         .collect::<Vec<_>>();
@@ -195,30 +199,29 @@ where
                     "timeout"
                 },
             );
-            commits.acknowledge(count);
-            if commits.due() {
-                commits
-                    .commit(&self.source)
-                    .await
-                    .map_err(PipelineError::Commit)?;
-            }
+            commits.acknowledge_delivery(count);
+            commit_eligible(&mut commits, &self.source)
+                .await
+                .map_err(PipelineError::Commit)?;
             if ended {
                 break;
             }
         }
-        commits
-            .commit(&self.source)
+        commits.finish();
+        commit_eligible(&mut commits, &self.source)
             .await
             .map(|_| ())
             .map_err(PipelineError::Commit)
     }
 }
 
-impl<So, Tr> FanoutCollectorPipeline<So, Tr, Shared, SharedRecord<Tr::Out, So::Position>, Collected>
+impl<So, Tr, C>
+    FanoutCollectorPipeline<So, Tr, Shared, SharedRecord<Tr::Out, So::Position>, Collected<C>>
 where
     So: Source,
     Tr: Transform<So::Payload, So::Position>,
     Tr::Out: Send + Sync + 'static,
+    C: CommitPolicy<So::Position>,
 {
     const TOPOLOGY: &str = "fanout_shared";
     pub async fn run(self) -> Result<(), PipelineError<So::Error, Tr::Error, ErasedError>> {
@@ -249,14 +252,14 @@ where
             })
             .buffered(transform.max_concurrency().get());
         tokio::pin!(records);
-        let mut commits = CommitState::new(self.strategy.commit);
+        let mut commits = CommitState::new(self.strategy.commit_policy);
 
         loop {
             let first = match next_or_commit_deadline(records.next(), commits.deadline()).await {
                 Deadline::Ready(first) => first,
                 Deadline::Elapsed => {
-                    commits
-                        .commit(&self.source)
+                    commits.handle_timeout();
+                    commit_eligible(&mut commits, &self.source)
                         .await
                         .map_err(PipelineError::Commit)?;
                     telemetry::commit(Self::TOPOLOGY, &pipeline_id, true);
@@ -276,7 +279,7 @@ where
             loop {
                 if let Some(record) = current.take() {
                     let record = Arc::new(record);
-                    commits.track::<So>(record.position());
+                    commits.track(record.position());
                     let results = futures_util::future::join_all(
                         collections
                             .iter_mut()
@@ -319,19 +322,16 @@ where
                     "timeout"
                 },
             );
-            commits.acknowledge(count);
-            if commits.due() {
-                commits
-                    .commit(&self.source)
-                    .await
-                    .map_err(PipelineError::Commit)?;
-            }
+            commits.acknowledge_delivery(count);
+            commit_eligible(&mut commits, &self.source)
+                .await
+                .map_err(PipelineError::Commit)?;
             if ended {
                 break;
             }
         }
-        commits
-            .commit(&self.source)
+        commits.finish();
+        commit_eligible(&mut commits, &self.source)
             .await
             .map(|_| ())
             .map_err(PipelineError::Commit)

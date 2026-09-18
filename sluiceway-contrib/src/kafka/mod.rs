@@ -42,7 +42,7 @@ use rdkafka::{
     message::{Header, Headers, OwnedHeaders, Timestamp},
     topic_partition_list::{Offset, TopicPartitionList},
 };
-use sluiceway_core::{Record, Source};
+use sluiceway_core::{Checkpoint, Record, Source};
 use thiserror::Error;
 
 /// Decoded Kafka contents with owned values and per-field decode outcomes.
@@ -104,11 +104,69 @@ where
     }
 }
 
-/// Last delivered offsets keyed by topic and partition.
+/// Last delivered offsets within one checkpoint epoch, keyed by topic and partition.
 ///
-/// The source folds the message-local positions in each batch into this map, which translates
-/// into Kafka's next-offset convention when the batch is committed.
-pub type KafkaCheckpoint = HashMap<(String, i32), i64>;
+/// The map may contain only the partitions observed in that epoch. Kafka commits treat omitted
+/// partitions as unchanged. The source translates included offsets into Kafka's next-offset
+/// convention when the epoch is committed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KafkaCheckpoint {
+    offsets: HashMap<(String, i32), i64>,
+}
+
+impl KafkaCheckpoint {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    pub fn get(&self, topic: &str, partition: i32) -> Option<i64> {
+        self.offsets.get(&(topic.to_owned(), partition)).copied()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&(String, i32), &i64)> {
+        self.offsets.iter()
+    }
+
+    pub fn into_inner(self) -> HashMap<(String, i32), i64> {
+        self.offsets
+    }
+
+    fn into_topic_partition_list(self) -> Result<TopicPartitionList, BrokerCommitterError> {
+        let mut partitions = TopicPartitionList::with_capacity(self.len());
+        for ((topic, partition), offset) in self.offsets {
+            let next_offset =
+                offset
+                    .checked_add(1)
+                    .ok_or_else(|| BrokerCommitterError::OffsetExhausted {
+                        topic: topic.clone(),
+                        partition,
+                        offset,
+                    })?;
+            partitions.add_partition_offset(&topic, partition, Offset::Offset(next_offset))?;
+        }
+        Ok(partitions)
+    }
+}
+
+impl From<HashMap<(String, i32), i64>> for KafkaCheckpoint {
+    fn from(offsets: HashMap<(String, i32), i64>) -> Self {
+        Self { offsets }
+    }
+}
+
+impl From<KafkaCheckpoint> for HashMap<(String, i32), i64> {
+    fn from(checkpoint: KafkaCheckpoint) -> Self {
+        checkpoint.into_inner()
+    }
+}
 
 /// The broker position of one consumed message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,7 +238,10 @@ type DeserializedRecord<Kd, Pd> = KafkaRecord<
     <Pd as KafkaDeserializer>::Error,
 >;
 
-/// Commits successfully delivered Kafka checkpoints.
+/// Commits successfully delivered Kafka checkpoint epochs.
+///
+/// A checkpoint can contain only the partitions observed in its epoch; implementations must leave
+/// omitted partition offsets unchanged.
 pub trait KafkaCommitter<C>: Send + Sync
 where
     C: ConsumerContext + 'static,
@@ -210,18 +271,7 @@ where
         checkpoint: KafkaCheckpoint,
     ) -> Result<(), Self::Error> {
         tokio::task::spawn_blocking(move || -> Result<(), BrokerCommitterError> {
-            let mut partitions = TopicPartitionList::with_capacity(checkpoint.len());
-            for ((topic, partition), offset) in checkpoint {
-                let next_offset =
-                    offset
-                        .checked_add(1)
-                        .ok_or_else(|| BrokerCommitterError::OffsetExhausted {
-                            topic: topic.clone(),
-                            partition,
-                            offset,
-                        })?;
-                partitions.add_partition_offset(&topic, partition, Offset::Offset(next_offset))?;
-            }
+            let partitions = checkpoint.into_topic_partition_list()?;
             consumer.commit(&partitions, CommitMode::Sync)?;
             Ok(())
         })
@@ -401,16 +451,19 @@ impl KafkaSource<DefaultConsumerContext, NoKeyDeserializer, MissingDeserializer>
     }
 }
 
-fn track_checkpoint(
-    checkpoint: Option<KafkaCheckpoint>,
-    position: &KafkaPosition,
-) -> KafkaCheckpoint {
-    let mut checkpoint = checkpoint.unwrap_or_default();
-    checkpoint
-        .entry((position.topic.clone(), position.partition))
-        .and_modify(|offset| *offset = (*offset).max(position.offset))
-        .or_insert(position.offset);
-    checkpoint
+impl Checkpoint<KafkaPosition> for KafkaCheckpoint {
+    fn start_epoch(position: &KafkaPosition) -> Self {
+        let mut checkpoint = Self::new();
+        checkpoint.include_position(position);
+        checkpoint
+    }
+
+    fn include_position(&mut self, position: &KafkaPosition) {
+        self.offsets
+            .entry((position.topic.clone(), position.partition))
+            .and_modify(|offset| *offset = (*offset).max(position.offset))
+            .or_insert(position.offset);
+    }
 }
 
 impl<C, Kd, Pd, Cm> KafkaSource<C, Kd, Pd, Cm>
@@ -465,10 +518,6 @@ where
         })
     }
 
-    fn track(checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
-        track_checkpoint(checkpoint, position)
-    }
-
     async fn commit(&self, checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
         self.committer
             .commit(Arc::clone(&self.consumer), checkpoint)
@@ -485,7 +534,7 @@ mod tests {
         ClientContext,
         message::{OwnedMessage, Timestamp},
     };
-    use sluiceway_core::Source;
+    use sluiceway_core::{Checkpoint, Source};
 
     use super::*;
 
@@ -503,21 +552,49 @@ mod tests {
 
     #[test]
     fn checkpoint_folds_interleaved_partition_positions() {
-        let checkpoint = [message_at(0, 4), message_at(1, 9), message_at(0, 5)]
+        let positions = [message_at(0, 4), message_at(1, 9), message_at(0, 5)]
             .iter()
             .map(message_position)
-            .fold(None, |checkpoint, position| {
-                Some(track_checkpoint(checkpoint, &position))
-            })
-            .unwrap();
+            .collect::<Vec<_>>();
+        let mut checkpoint = KafkaCheckpoint::start_epoch(&positions[0]);
+        for position in &positions[1..] {
+            checkpoint.include_position(position);
+        }
 
-        assert_eq!(checkpoint.get(&("events".to_owned(), 0)), Some(&5));
-        assert_eq!(checkpoint.get(&("events".to_owned(), 1)), Some(&9));
+        assert_eq!(checkpoint.get("events", 0), Some(5));
+        assert_eq!(checkpoint.get("events", 1), Some(9));
+    }
+
+    #[test]
+    fn checkpoint_supports_inspection_and_map_conversion() {
+        let offsets = HashMap::from([(("events".to_owned(), 2), 41)]);
+        let checkpoint = KafkaCheckpoint::from(offsets.clone());
+
+        assert!(!checkpoint.is_empty());
+        assert_eq!(checkpoint.len(), 1);
+        assert_eq!(checkpoint.get("events", 2), Some(41));
+        assert_eq!(checkpoint.iter().count(), 1);
+        assert_eq!(checkpoint.into_inner(), offsets);
+
+        let checkpoint = KafkaCheckpoint::from(offsets.clone());
+        assert_eq!(HashMap::from(checkpoint), offsets);
+    }
+
+    #[test]
+    fn checkpoint_conversion_advances_to_kafkas_next_offset() {
+        let checkpoint = KafkaCheckpoint::from(HashMap::from([(("events".to_owned(), 2), 41)]));
+        let partitions = checkpoint.into_topic_partition_list().unwrap();
+
+        assert_eq!(
+            partitions.find_partition("events", 2).unwrap().offset(),
+            Offset::Offset(42)
+        );
     }
 
     #[tokio::test]
     async fn broker_committer_rejects_an_exhausted_offset() {
-        let checkpoint = HashMap::from([(("events".to_owned(), 0), i64::MAX)]);
+        let checkpoint =
+            KafkaCheckpoint::from(HashMap::from([(("events".to_owned(), 0), i64::MAX)]));
 
         assert!(matches!(
             BrokerCommitter.commit(custom_consumer(), checkpoint).await,
@@ -666,7 +743,7 @@ mod tests {
             .payload_deserializer(bytes)
             .committer(RecordingCommitter(Arc::clone(&commits)))
             .build();
-        let checkpoint = HashMap::from([(("events".to_owned(), 2), 41)]);
+        let checkpoint = KafkaCheckpoint::from(HashMap::from([(("events".to_owned(), 2), 41)]));
 
         source.commit(checkpoint.clone()).await.unwrap();
 
@@ -680,7 +757,7 @@ mod tests {
             .payload_deserializer(bytes)
             .committer(NoCommitter)
             .build();
-        let checkpoint = HashMap::from([(("events".to_owned(), 0), 1)]);
+        let checkpoint = KafkaCheckpoint::from(HashMap::from([(("events".to_owned(), 0), 1)]));
 
         source.commit(checkpoint).await.unwrap();
     }

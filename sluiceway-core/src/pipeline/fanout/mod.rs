@@ -7,7 +7,7 @@ use crate::{
     telemetry,
 };
 
-use super::{BatchPolicy, Batched, CollectPolicy, Collected, CommitPolicy, Each, Unset};
+use super::{BatchPolicy, Batched, CollectPolicy, Collected, CommitEach, Each, Unset};
 
 mod batched;
 mod collected;
@@ -60,22 +60,37 @@ where
             collectors: self.collectors,
             strategy: Collected {
                 policy,
-                commit: CommitPolicy::default(),
+                commit_policy: CommitEach,
             },
             mode: PhantomData,
         }
     }
 }
 
-impl<So, Tr, Mode, Input> FanoutCollectorPipeline<So, Tr, Mode, Input, Collected>
+impl<So, Tr, Mode, Input, C> FanoutCollectorPipeline<So, Tr, Mode, Input, Collected<C>>
 where
     So: Source,
     Tr: Transform<So::Payload, So::Position>,
     Input: Send + 'static,
 {
-    pub fn commit_policy(mut self, policy: CommitPolicy) -> Self {
-        self.strategy.commit = policy;
-        self
+    pub fn commit_policy<Next>(
+        self,
+        policy: Next,
+    ) -> FanoutCollectorPipeline<So, Tr, Mode, Input, Collected<Next>>
+    where
+        Next: super::CommitPolicy<So::Position>,
+    {
+        FanoutCollectorPipeline {
+            id: self.id,
+            source: self.source,
+            transform: self.transform,
+            collectors: self.collectors,
+            strategy: Collected {
+                policy: self.strategy.policy,
+                commit_policy: policy,
+            },
+            mode: PhantomData,
+        }
     }
 }
 
@@ -124,7 +139,7 @@ where
             sinks: self.sinks,
             strategy: Batched {
                 policy,
-                commit: CommitPolicy::default(),
+                commit_policy: CommitEach,
             },
             mode: PhantomData,
         }
@@ -137,33 +152,62 @@ where
             transform: self.transform,
             sinks: self.sinks,
             strategy: Each {
-                commit: CommitPolicy::default(),
+                commit_policy: CommitEach,
             },
             mode: PhantomData,
         }
     }
 }
 
-impl<So, Tr, Mode, Input> FanoutPipeline<So, Tr, Mode, Input, Batched>
+impl<So, Tr, Mode, Input, C> FanoutPipeline<So, Tr, Mode, Input, Batched<C>>
 where
     So: Source,
     Tr: Transform<So::Payload, So::Position>,
     Input: Send + 'static,
 {
-    pub fn commit_policy(mut self, policy: CommitPolicy) -> Self {
-        self.strategy.commit = policy;
-        self
+    pub fn commit_policy<Next>(
+        self,
+        policy: Next,
+    ) -> FanoutPipeline<So, Tr, Mode, Input, Batched<Next>>
+    where
+        Next: super::CommitPolicy<So::Position>,
+    {
+        FanoutPipeline {
+            id: self.id,
+            source: self.source,
+            transform: self.transform,
+            sinks: self.sinks,
+            strategy: Batched {
+                policy: self.strategy.policy,
+                commit_policy: policy,
+            },
+            mode: PhantomData,
+        }
     }
 }
 
-impl<So, Tr, Mode, Input> FanoutPipeline<So, Tr, Mode, Input, Each>
+impl<So, Tr, Mode, Input, C> FanoutPipeline<So, Tr, Mode, Input, Each<C>>
 where
     So: Source,
     Tr: Transform<So::Payload, So::Position>,
     Input: Send + 'static,
 {
-    pub fn commit_policy(mut self, policy: CommitPolicy) -> Self {
-        self.strategy.commit = policy;
-        self
+    pub fn commit_policy<Next>(
+        self,
+        policy: Next,
+    ) -> FanoutPipeline<So, Tr, Mode, Input, Each<Next>>
+    where
+        Next: super::CommitPolicy<So::Position>,
+    {
+        FanoutPipeline {
+            id: self.id,
+            source: self.source,
+            transform: self.transform,
+            sinks: self.sinks,
+            strategy: Each {
+                commit_policy: policy,
+            },
+            mode: PhantomData,
+        }
     }
 }

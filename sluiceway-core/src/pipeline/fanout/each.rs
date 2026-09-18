@@ -9,14 +9,18 @@ use crate::{
 };
 
 use super::FanoutPipeline;
-use crate::pipeline::{Each, policy::CommitState};
+use crate::pipeline::{
+    CommitPolicy, Each,
+    policy::{CommitState, commit_eligible},
+};
 
-impl<So, Tr> FanoutPipeline<So, Tr, Cloned, Record<Tr::Out, So::Position>, Each>
+impl<So, Tr, C> FanoutPipeline<So, Tr, Cloned, Record<Tr::Out, So::Position>, Each<C>>
 where
     So: Source,
     Tr: Transform<So::Payload, So::Position>,
     Tr::Out: Clone + Send + 'static,
     So::Position: Clone,
+    C: CommitPolicy<So::Position>,
 {
     const TOPOLOGY: &str = "fanout_cloned";
     pub async fn run(self) -> Result<(), PipelineError<So::Error, Tr::Error, ErasedError>> {
@@ -51,14 +55,17 @@ where
             })
             .buffered(transform.max_concurrency().get());
         tokio::pin!(records);
-        let mut commits = CommitState::new(self.strategy.commit);
+        let mut commits = CommitState::new(self.strategy.commit_policy);
 
         loop {
             let next = if let Some(deadline) = commits.deadline() {
                 tokio::select! {
                     item = records.next() => item,
                     () = tokio::time::sleep_until(deadline) => {
-                        commits.commit(&self.source).await.map_err(PipelineError::Commit)?;
+                        commits.handle_timeout();
+                        commit_eligible(&mut commits, &self.source)
+                            .await
+                            .map_err(PipelineError::Commit)?;
                         telemetry::commit(Self::TOPOLOGY, &pipeline_id, true);
                         continue;
                     }
@@ -68,7 +75,7 @@ where
             };
             let Some(record) = next else { break };
             let record = record?;
-            commits.track::<So>(record.position());
+            commits.track(record.position());
             let mut tasks = JoinSet::new();
             for sink in &self.sinks {
                 let sink = sink.clone();
@@ -79,28 +86,28 @@ where
             if !failures.is_empty() {
                 return Err(PipelineError::Sinks(failures));
             }
-            commits.acknowledge(1);
-            if commits.due() {
-                commits
-                    .commit(&self.source)
-                    .await
-                    .map_err(PipelineError::Commit)?;
+            commits.acknowledge_delivery(1);
+            if commit_eligible(&mut commits, &self.source)
+                .await
+                .map_err(PipelineError::Commit)?
+            {
                 telemetry::commit(Self::TOPOLOGY, &pipeline_id, true);
             }
         }
-        commits
-            .commit(&self.source)
+        commits.finish();
+        commit_eligible(&mut commits, &self.source)
             .await
             .map(|_| ())
             .map_err(PipelineError::Commit)
     }
 }
 
-impl<So, Tr> FanoutPipeline<So, Tr, Shared, SharedRecord<Tr::Out, So::Position>, Each>
+impl<So, Tr, C> FanoutPipeline<So, Tr, Shared, SharedRecord<Tr::Out, So::Position>, Each<C>>
 where
     So: Source,
     Tr: Transform<So::Payload, So::Position>,
     Tr::Out: Send + Sync + 'static,
+    C: CommitPolicy<So::Position>,
 {
     const TOPOLOGY: &str = "fanout_shared";
     pub async fn run(self) -> Result<(), PipelineError<So::Error, Tr::Error, ErasedError>> {
@@ -135,14 +142,17 @@ where
             })
             .buffered(transform.max_concurrency().get());
         tokio::pin!(records);
-        let mut commits = CommitState::new(self.strategy.commit);
+        let mut commits = CommitState::new(self.strategy.commit_policy);
 
         loop {
             let next = if let Some(deadline) = commits.deadline() {
                 tokio::select! {
                     item = records.next() => item,
                     () = tokio::time::sleep_until(deadline) => {
-                        commits.commit(&self.source).await.map_err(PipelineError::Commit)?;
+                        commits.handle_timeout();
+                        commit_eligible(&mut commits, &self.source)
+                            .await
+                            .map_err(PipelineError::Commit)?;
                         telemetry::commit(Self::TOPOLOGY, &pipeline_id, true);
                         continue;
                     }
@@ -152,7 +162,7 @@ where
             };
             let Some(record) = next else { break };
             let record = Arc::new(record?);
-            commits.track::<So>(record.position());
+            commits.track(record.position());
             let mut tasks = JoinSet::new();
             for sink in &self.sinks {
                 let sink = sink.clone();
@@ -163,17 +173,16 @@ where
             if !failures.is_empty() {
                 return Err(PipelineError::Sinks(failures));
             }
-            commits.acknowledge(1);
-            if commits.due() {
-                commits
-                    .commit(&self.source)
-                    .await
-                    .map_err(PipelineError::Commit)?;
+            commits.acknowledge_delivery(1);
+            if commit_eligible(&mut commits, &self.source)
+                .await
+                .map_err(PipelineError::Commit)?
+            {
                 telemetry::commit(Self::TOPOLOGY, &pipeline_id, true);
             }
         }
-        commits
-            .commit(&self.source)
+        commits.finish();
+        commit_eligible(&mut commits, &self.source)
             .await
             .map(|_| ())
             .map_err(PipelineError::Commit)
