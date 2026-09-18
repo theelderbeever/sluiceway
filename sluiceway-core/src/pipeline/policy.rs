@@ -1,37 +1,40 @@
-use std::{future::Future, num::NonZeroUsize, time::Duration};
+use std::{
+    collections::VecDeque, future::Future, marker::PhantomData, num::NonZeroUsize, time::Duration,
+};
 
 use futures_core::Stream;
 use futures_util::StreamExt;
 
-use crate::{BatchConfigError, CollectConfigError, CommitConfigError, Source};
+use crate::{BatchConfigError, Checkpoint, CollectConfigError, CommitConfigError, Source};
 
 /// Type-state marker for a pipeline stage that has not been configured.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Unset;
 
 /// Type-state marker carrying validated batch settings.
-pub struct Batched {
+pub struct Batched<CP = CommitEach> {
     pub(super) policy: BatchPolicy,
-    pub(super) commit: CommitPolicy,
+    pub(super) commit_policy: CP,
 }
 
 /// Type-state marker selecting one-record-at-a-time sink delivery.
-pub struct Each {
-    pub(super) commit: CommitPolicy,
+pub struct Each<CP = CommitEach> {
+    pub(super) commit_policy: CP,
 }
 
 /// Type-state marker selecting incremental, batch-scoped collection.
-pub struct Collected {
+pub struct Collected<CP = CommitEach> {
     pub(super) policy: CollectPolicy,
-    pub(super) commit: CommitPolicy,
+    pub(super) commit_policy: CP,
 }
 
 /// Controls when successfully delivered source progress is committed.
 ///
-/// A commit policy is evaluated only after a delivery unit has been durably acknowledged. A
-/// delivery unit is one record for [`Each`], one complete batch for [`Batched`], or one collector
-/// [`crate::Collection`] whose [`crate::Collection::finish`] call succeeded for [`Collected`]. Fanout
-/// acknowledges the unit only after every branch succeeds.
+/// Position actions are evaluated as records enter delivery, but completed checkpoint epochs do not
+/// become eligible until the complete delivery unit is acknowledged. A delivery unit is one record
+/// for [`Each`], one complete batch for [`Batched`], or one collector [`crate::Collection`] whose
+/// [`crate::Collection::finish`] call succeeded for [`Collected`]. Fanout acknowledges the unit only
+/// after every branch succeeds.
 ///
 /// A timeout starts with the first acknowledgement after the previous commit. It is not a
 /// cancellation deadline: if it expires while a sink or collector is running, that operation is
@@ -40,43 +43,150 @@ pub struct Collected {
 /// Clean EOF and graceful shutdown commit any remaining acknowledged progress regardless of the
 /// configured count. A failed delivery is not acknowledged and does not cause an opportunistic
 /// commit.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CommitPolicy {
-    records: Option<NonZeroUsize>,
-    timeout: Option<Duration>,
+pub trait CommitPolicy<P>: Send {
+    /// Observe a position immediately before it enters an ordered delivery attempt.
+    fn on_position(&mut self, _position: &P) -> PositionAction {
+        PositionAction::Continue
+    }
+
+    /// Observe one successfully acknowledged delivery unit.
+    fn on_acknowledged(&mut self, records: usize) -> CommitAction;
+
+    /// Return the next commit deadline, if any.
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        None
+    }
+
+    /// Handle a deadline at a safe boundary.
+    ///
+    /// An implementation returning [`CommitAction::Continue`] must clear or advance its deadline
+    /// to avoid the runner immediately observing the same deadline again.
+    fn on_timeout(&mut self) -> CommitAction {
+        CommitAction::CommitLatest
+    }
+
+    /// Observe one successfully persisted checkpoint epoch.
+    fn on_committed(&mut self);
 }
 
-impl CommitPolicy {
-    /// Commit after every successfully acknowledged sink operation or collection.
-    pub const fn each() -> Self {
+/// Action requested while observing a source position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionAction {
+    /// Add the current position to the open checkpoint epoch.
+    Continue,
+    /// Close the open checkpoint epoch before the current position, then start the next epoch with
+    /// the current position.
+    StartNewEpoch,
+}
+
+/// Action requested at an acknowledgement or timeout boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitAction {
+    Continue,
+    CommitLatest,
+}
+
+/// Commit after every successfully acknowledged delivery unit.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CommitEach;
+
+impl<P> CommitPolicy<P> for CommitEach {
+    fn on_acknowledged(&mut self, _records: usize) -> CommitAction {
+        CommitAction::CommitLatest
+    }
+
+    fn on_committed(&mut self) {}
+}
+
+/// Commit after at least a configured number of records have been acknowledged.
+#[derive(Debug, Clone, Copy)]
+pub struct AfterRecords {
+    records: NonZeroUsize,
+    acknowledged: usize,
+}
+
+impl AfterRecords {
+    /// Construct a policy from a validated nonzero record count.
+    pub const fn new(records: NonZeroUsize) -> Self {
         Self {
-            records: None,
-            timeout: None,
+            records,
+            acknowledged: 0,
         }
     }
 
-    /// Commit after at least `records` source records have been acknowledged.
-    pub fn after(records: usize) -> Result<Self, CommitConfigError> {
+    /// Validate a record count and construct a policy.
+    pub fn try_new(records: usize) -> Result<Self, CommitConfigError> {
         let records = NonZeroUsize::new(records).ok_or(CommitConfigError::ZeroRecords)?;
-        Ok(Self {
-            records: Some(records),
-            timeout: None,
-        })
+        Ok(Self::new(records))
+    }
+}
+
+impl<P> CommitPolicy<P> for AfterRecords {
+    // Intentionally a softmax so batches can go over the threshold
+    fn on_acknowledged(&mut self, records: usize) -> CommitAction {
+        self.acknowledged = self.acknowledged.saturating_add(records);
+        if self.acknowledged >= self.records.get() {
+            CommitAction::CommitLatest
+        } else {
+            CommitAction::Continue
+        }
     }
 
-    /// Commit after `records` acknowledged source records or `timeout`, whichever is reached first.
-    ///
-    /// The timer begins when the first delivery unit after a commit is acknowledged. Expiration is
-    /// observed between delivery units and never interrupts an in-flight sink or collector.
-    pub fn after_or_timeout(records: usize, timeout: Duration) -> Result<Self, CommitConfigError> {
-        let records = NonZeroUsize::new(records).ok_or(CommitConfigError::ZeroRecords)?;
+    fn on_committed(&mut self) {
+        self.acknowledged = 0;
+    }
+}
+
+/// Commit after a record count or timeout, whichever is reached first.
+#[derive(Debug, Clone, Copy)]
+pub struct AfterRecordsOrTimeout {
+    records: NonZeroUsize,
+    timeout: Duration,
+    acknowledged: usize,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl AfterRecordsOrTimeout {
+    /// Construct a policy from a validated count and a nonzero timeout.
+    pub fn new(records: NonZeroUsize, timeout: Duration) -> Result<Self, CommitConfigError> {
         if timeout.is_zero() {
             return Err(CommitConfigError::ZeroTimeout);
         }
         Ok(Self {
-            records: Some(records),
-            timeout: Some(timeout),
+            records,
+            timeout,
+            acknowledged: 0,
+            deadline: None,
         })
+    }
+
+    /// Validate a record count and timeout and construct a policy.
+    pub fn try_new(records: usize, timeout: Duration) -> Result<Self, CommitConfigError> {
+        let records = NonZeroUsize::new(records).ok_or(CommitConfigError::ZeroRecords)?;
+        Self::new(records, timeout)
+    }
+}
+
+impl<P> CommitPolicy<P> for AfterRecordsOrTimeout {
+    fn on_acknowledged(&mut self, records: usize) -> CommitAction {
+        self.acknowledged = self.acknowledged.saturating_add(records);
+        if self.deadline.is_none() {
+            self.deadline = Some(tokio::time::Instant::now() + self.timeout);
+        }
+        if self.acknowledged >= self.records.get() {
+            CommitAction::CommitLatest
+        } else {
+            CommitAction::Continue
+        }
+    }
+
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+    }
+
+    fn on_committed(&mut self) {
+        self.acknowledged = 0;
+        self.deadline = None;
     }
 }
 
@@ -109,62 +219,150 @@ impl CollectPolicy {
     }
 }
 
-pub(super) struct CommitState<C> {
-    policy: CommitPolicy,
-    checkpoint: Option<C>,
-    records: usize,
-    deadline: Option<tokio::time::Instant>,
+/// Runner-owned checkpoint state spanning delivery units between commits.
+///
+/// Checkpoints are opaque, so an epoch boundary cannot be represented as an index into the source
+/// positions or reconstructed later. Each transition moves the completed epoch into
+/// `staged_epochs` until the delivery unit succeeds, then into `eligible_epochs` until it is
+/// committed in source order.
+pub(super) struct CommitState<C, Policy, Position>
+where
+    C: Checkpoint<Position>,
+    Policy: CommitPolicy<Position>,
+{
+    policy: Policy,
+    /// The open checkpoint epoch.
+    current_epoch: Option<C>,
+    /// Epochs closed during the current, not-yet-acknowledged delivery unit.
+    staged_epochs: Vec<C>,
+    /// Acknowledged checkpoint epochs waiting to be committed in source order.
+    eligible_epochs: VecDeque<C>,
+    /// Whether the open epoch contains only acknowledged progress.
+    current_epoch_acknowledged: bool,
+    position: PhantomData<fn(&Position)>,
 }
 
-impl<C> CommitState<C> {
-    pub(super) fn new(policy: CommitPolicy) -> Self {
+impl<C, Policy, Position> CommitState<C, Policy, Position>
+where
+    C: Checkpoint<Position>,
+    Policy: CommitPolicy<Position>,
+{
+    pub(super) fn new(policy: Policy) -> Self {
         Self {
             policy,
-            checkpoint: None,
-            records: 0,
-            deadline: None,
+            current_epoch: None,
+            staged_epochs: Vec::new(),
+            eligible_epochs: VecDeque::new(),
+            current_epoch_acknowledged: false,
+            position: PhantomData,
         }
     }
 
-    pub(super) fn track<S>(&mut self, position: &S::Position)
-    where
-        S: Source<Checkpoint = C>,
-    {
-        self.checkpoint = Some(S::track(self.checkpoint.take(), position));
+    /// Observe and fold a position immediately before it enters sink delivery.
+    ///
+    /// Starting a new epoch closes the checkpoint preceding `position`; the current position always
+    /// belongs to the next epoch. Closed epochs remain staged because the surrounding record, batch,
+    /// collection, or fanout operation can still fail.
+    pub(super) fn track(&mut self, position: &Position) {
+        match self.policy.on_position(position) {
+            PositionAction::Continue => match self.current_epoch.as_mut() {
+                Some(epoch) => epoch.include_position(position),
+                None => self.current_epoch = Some(C::start_epoch(position)),
+            },
+            PositionAction::StartNewEpoch => match self.current_epoch.take() {
+                Some(current_epoch) => {
+                    let transition = current_epoch.start_next_epoch(position);
+                    self.staged_epochs.push(transition.completed_epoch);
+                    self.current_epoch = Some(transition.next_epoch);
+                }
+                None => {
+                    self.current_epoch = Some(C::start_epoch(position));
+                }
+            },
+        }
+        self.current_epoch_acknowledged = false;
     }
 
-    pub(super) fn acknowledge(&mut self, records: usize) {
-        self.records = self.records.saturating_add(records);
-        if self.deadline.is_none()
-            && let Some(timeout) = self.policy.timeout
+    /// Mark one complete delivery unit as successful and apply the policy at that safe boundary.
+    ///
+    /// All epochs closed within the unit become eligible together. A count action may also close
+    /// the latest epoch. When no count action fires, an already-passed deadline is applied after
+    /// including this unit's progress, so timeouts never interrupt sink work.
+    pub(super) fn acknowledge_delivery(&mut self, records: usize) {
+        self.eligible_epochs.extend(self.staged_epochs.drain(..));
+        self.current_epoch_acknowledged = self.current_epoch.is_some();
+        let action = self.policy.on_acknowledged(records);
+        let timed_out = action == CommitAction::Continue
+            && self
+                .policy
+                .deadline()
+                .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
+        if action == CommitAction::CommitLatest
+            || timed_out && self.policy.on_timeout() == CommitAction::CommitLatest
         {
-            self.deadline = Some(tokio::time::Instant::now() + timeout);
+            self.queue_latest();
         }
     }
 
-    pub(super) fn due(&self) -> bool {
-        self.policy
-            .records
-            .is_none_or(|records| self.records >= records.get())
-            && self.checkpoint.is_some()
-    }
-
+    /// Return a deadline only when the open epoch is safe to commit.
+    ///
+    /// Runners call this while waiting between delivery units. During a delivery, the open
+    /// checkpoint may include unacknowledged records and must not be exposed to a timeout commit.
     pub(super) fn deadline(&self) -> Option<tokio::time::Instant> {
-        self.deadline.filter(|_| self.checkpoint.is_some())
+        self.current_epoch_acknowledged
+            .then(|| self.policy.deadline())
+            .flatten()
     }
 
-    pub(super) async fn commit<S>(&mut self, source: &S) -> Result<bool, S::Error>
-    where
-        S: Source<Checkpoint = C>,
-    {
-        let Some(checkpoint) = self.checkpoint.take() else {
-            return Ok(false);
-        };
-        source.commit(checkpoint).await?;
-        self.records = 0;
-        self.deadline = None;
-        Ok(true)
+    /// Apply a reached policy deadline while the runner is at a safe boundary.
+    pub(super) fn handle_timeout(&mut self) {
+        if self.policy.on_timeout() == CommitAction::CommitLatest {
+            self.queue_latest();
+        }
     }
+
+    /// Make all remaining progress eligible after clean EOF or graceful shutdown.
+    ///
+    /// Error paths deliberately do not call this method, preserving the rule that operational
+    /// failures never cause an opportunistic final commit.
+    pub(super) fn finish(&mut self) {
+        self.eligible_epochs.extend(self.staged_epochs.drain(..));
+        self.queue_latest();
+    }
+
+    /// Close the open epoch and append it after any earlier completed epochs.
+    fn queue_latest(&mut self) {
+        if let Some(checkpoint) = self.current_epoch.take() {
+            self.eligible_epochs.push_back(checkpoint);
+        }
+        self.current_epoch_acknowledged = false;
+    }
+
+    pub(super) fn pop_eligible(&mut self) -> Option<C> {
+        self.eligible_epochs.pop_front()
+    }
+
+    pub(super) fn committed(&mut self) {
+        self.policy.on_committed();
+    }
+}
+
+pub(super) async fn commit_eligible<S, C, Policy>(
+    state: &mut CommitState<C, Policy, S::Position>,
+    source: &S,
+) -> Result<bool, S::Error>
+where
+    S: Source<Checkpoint = C>,
+    C: Checkpoint<S::Position>,
+    Policy: CommitPolicy<S::Position>,
+{
+    let mut committed = false;
+    while let Some(epoch) = state.pop_eligible() {
+        source.commit(epoch).await?;
+        state.committed();
+        committed = true;
+    }
+    Ok(committed)
 }
 
 /// Validated limits for flushing record batches.
@@ -218,7 +416,7 @@ impl BatchPolicy {
     }
 }
 
-impl Batched {
+impl BatchPolicy {
     pub(super) async fn consume<S, T, E, Consume, Consuming, Deadline, OnTimer, Timing>(
         &self,
         batches: S,
@@ -236,7 +434,7 @@ impl Batched {
     {
         tokio::pin!(batches);
 
-        if self.policy.prefetch == 0 {
+        if self.prefetch == 0 {
             loop {
                 let batch = if let Some(deadline) = deadline() {
                     tokio::select! {
@@ -257,7 +455,7 @@ impl Batched {
             return Ok(());
         }
 
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(self.policy.prefetch);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(self.prefetch);
         let producer = async move {
             loop {
                 let Ok(permit) = sender.reserve().await else {
@@ -300,5 +498,40 @@ impl Batched {
             result = &mut consumer => result,
             () = &mut producer => consumer.await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AfterRecords, CommitAction, CommitPolicy};
+
+    #[test]
+    fn after_records_resets_only_after_a_successful_commit() {
+        let mut policy = AfterRecords::try_new(3).unwrap();
+
+        assert_eq!(
+            <AfterRecords as CommitPolicy<()>>::on_acknowledged(&mut policy, 2),
+            CommitAction::Continue
+        );
+        assert_eq!(
+            <AfterRecords as CommitPolicy<()>>::on_acknowledged(&mut policy, 1),
+            CommitAction::CommitLatest
+        );
+        <AfterRecords as CommitPolicy<()>>::on_committed(&mut policy);
+        assert_eq!(
+            <AfterRecords as CommitPolicy<()>>::on_acknowledged(&mut policy, 1),
+            CommitAction::Continue
+        );
+    }
+
+    #[test]
+    fn after_records_uses_saturating_accounting() {
+        let mut policy = AfterRecords::try_new(2).unwrap();
+        policy.acknowledged = usize::MAX;
+
+        assert_eq!(
+            <AfterRecords as CommitPolicy<()>>::on_acknowledged(&mut policy, 1),
+            CommitAction::CommitLatest
+        );
     }
 }

@@ -94,9 +94,17 @@ reference alongside each owned payload, and the resulting records retain those p
 delivery. Collection and checkpoint cadence are independent: `.each()` delivers `Record<T, P>`
 values individually, `.batched(...)` delivers materialized `Batch<T, P>` values, and
 `.collect(...)` uses a `Collector` to open an incremental `Collection`, pushes records into it, and
-acknowledges the collection when `finish()` succeeds. `CommitPolicy::each()`, `after(records)`, and
-`after_or_timeout(records, timeout)` control when the successfully delivered frontier is persisted.
-Checkpoint persistence remains source-owned through `CheckpointStore<C>`.
+acknowledges the collection when `finish()` succeeds. `CommitEach` (the default),
+`AfterRecords::try_new(records)`, and `AfterRecordsOrTimeout::try_new(records, timeout)` control
+when the successfully delivered frontier is persisted. Custom `CommitPolicy<P>` implementations
+may also close one checkpoint epoch and start another at a source-position boundary. Durable commit
+remains source-owned through `Source::commit`; `CheckpointStore<C>` is available to persist already
+constructed checkpoint values.
+
+Checkpoint values implement `Checkpoint<P>` and are built directly by the runner. By default,
+`Checkpoint::start_next_epoch` creates an independently committable next epoch. Checkpoint types
+representing complete frontiers can override that method to carry state into the next epoch; this
+keeps cloning and equality requirements local to the checkpoint representation.
 
 Commit timing follows delivery acknowledgements rather than interrupting delivery:
 

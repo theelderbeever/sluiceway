@@ -4,7 +4,19 @@ use std::{convert::Infallible, time::Duration};
 
 use futures_core::Stream;
 use futures_util::stream;
-use sluiceway::{Batch, BatchPolicy, Pipeline, Record, Sink, Source};
+use sluiceway::{Batch, BatchPolicy, Checkpoint, Pipeline, Record, Sink, Source};
+
+struct Cursor(u64);
+
+impl Checkpoint<u64> for Cursor {
+    fn start_epoch(position: &u64) -> Self {
+        Self(*position)
+    }
+
+    fn include_position(&mut self, position: &u64) {
+        self.0 = *position;
+    }
+}
 
 struct Numbers {
     end: u64,
@@ -13,7 +25,7 @@ struct Numbers {
 impl Source for Numbers {
     type Payload = u64;
     type Position = u64;
-    type Checkpoint = u64;
+    type Checkpoint = Cursor;
     type Error = Infallible;
 
     fn stream(
@@ -23,12 +35,8 @@ impl Source for Numbers {
         stream::iter((0..self.end).map(|number| Ok(Record::new(number, number))))
     }
 
-    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
-        *position
-    }
-
     async fn commit(&self, checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
-        println!("committed through source position {checkpoint}");
+        println!("committed through source position {}", checkpoint.0);
         Ok(())
     }
 }

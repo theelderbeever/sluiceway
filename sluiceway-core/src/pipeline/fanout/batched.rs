@@ -9,14 +9,18 @@ use crate::{
 };
 
 use super::FanoutPipeline;
-use crate::pipeline::{Batched, policy::CommitState};
+use crate::pipeline::{
+    Batched, CommitPolicy,
+    policy::{CommitState, commit_eligible},
+};
 
-impl<So, Tr> FanoutPipeline<So, Tr, Cloned, Batch<Tr::Out, So::Position>, Batched>
+impl<So, Tr, C> FanoutPipeline<So, Tr, Cloned, Batch<Tr::Out, So::Position>, Batched<C>>
 where
     So: Source,
     Tr: Transform<So::Payload, So::Position>,
     Tr::Out: Clone + Send + 'static,
     So::Position: Clone,
+    C: CommitPolicy<So::Position>,
 {
     const TOPOLOGY: &str = "fanout_cloned";
     /// Run until the source stream reaches its natural end.
@@ -70,14 +74,14 @@ where
         tokio::pin!(chunks);
 
         let batches = chunks.map(Batch::try_from_chunk);
+        let batch_policy = self.strategy.policy;
         let commits = Arc::new(tokio::sync::Mutex::new(CommitState::new(
-            self.strategy.commit,
+            self.strategy.commit_policy,
         )));
         let source = &self.source;
-        let strategy = &self.strategy;
         let sinks = &self.sinks;
 
-        strategy
+        batch_policy
             .consume(
                 batches,
                 |batch| {
@@ -85,10 +89,10 @@ where
                     let pipeline_id = pipeline_id.clone();
                     async move {
                         let mut commits = commits.lock().await;
-                        let reason = strategy.policy.emit_reason(batch.len());
+                        let reason = batch_policy.emit_reason(batch.len());
                         telemetry::batch(Self::TOPOLOGY, &pipeline_id, batch.len(), reason);
                         for record in batch.iter() {
-                            commits.track::<So>(record.position());
+                            commits.track(record.position());
                         }
                         let records = batch.len();
                         let mut tasks = JoinSet::new();
@@ -124,12 +128,11 @@ where
                             return Err(PipelineError::Sinks(failures));
                         }
 
-                        commits.acknowledge(records);
-                        if commits.due() {
-                            commits
-                                .commit(source)
-                                .await
-                                .map_err(PipelineError::Commit)?;
+                        commits.acknowledge_delivery(records);
+                        if commit_eligible(&mut commits, source)
+                            .await
+                            .map_err(PipelineError::Commit)?
+                        {
                             telemetry::commit(Self::TOPOLOGY, &pipeline_id, true);
                         }
                         Ok(())
@@ -149,10 +152,9 @@ where
                     move || {
                         let commits = Arc::clone(&commits);
                         async move {
-                            commits
-                                .lock()
-                                .await
-                                .commit(source)
+                            let mut commits = commits.lock().await;
+                            commits.handle_timeout();
+                            commit_eligible(&mut commits, source)
                                 .await
                                 .map(|_| ())
                                 .map_err(PipelineError::Commit)
@@ -161,21 +163,21 @@ where
                 },
             )
             .await?;
-        commits
-            .lock()
-            .await
-            .commit(source)
+        let mut commits = commits.lock().await;
+        commits.finish();
+        commit_eligible(&mut commits, source)
             .await
             .map(|_| ())
             .map_err(PipelineError::Commit)
     }
 }
 
-impl<So, Tr> FanoutPipeline<So, Tr, Shared, SharedBatch<Tr::Out, So::Position>, Batched>
+impl<So, Tr, C> FanoutPipeline<So, Tr, Shared, SharedBatch<Tr::Out, So::Position>, Batched<C>>
 where
     So: Source,
     Tr: Transform<So::Payload, So::Position>,
     Tr::Out: Send + Sync + 'static,
+    C: CommitPolicy<So::Position>,
 {
     const TOPOLOGY: &str = "fanout_shared";
     /// Run until the source stream reaches its natural end.
@@ -229,14 +231,14 @@ where
         tokio::pin!(chunks);
 
         let batches = chunks.map(Batch::try_from_chunk);
+        let batch_policy = self.strategy.policy;
         let commits = Arc::new(tokio::sync::Mutex::new(CommitState::new(
-            self.strategy.commit,
+            self.strategy.commit_policy,
         )));
         let source = &self.source;
-        let strategy = &self.strategy;
         let sinks = &self.sinks;
 
-        strategy
+        batch_policy
             .consume(
                 batches,
                 |batch| {
@@ -244,10 +246,10 @@ where
                     let pipeline_id = pipeline_id.clone();
                     async move {
                         let mut commits = commits.lock().await;
-                        let reason = strategy.policy.emit_reason(batch.len());
+                        let reason = batch_policy.emit_reason(batch.len());
                         telemetry::batch(Self::TOPOLOGY, &pipeline_id, batch.len(), reason);
                         for record in batch.iter() {
-                            commits.track::<So>(record.position());
+                            commits.track(record.position());
                         }
                         let records = batch.len();
                         let batch: SharedBatch<Tr::Out, So::Position> = Arc::new(batch);
@@ -272,12 +274,11 @@ where
                             return Err(PipelineError::Sinks(failures));
                         }
 
-                        commits.acknowledge(records);
-                        if commits.due() {
-                            commits
-                                .commit(source)
-                                .await
-                                .map_err(PipelineError::Commit)?;
+                        commits.acknowledge_delivery(records);
+                        if commit_eligible(&mut commits, source)
+                            .await
+                            .map_err(PipelineError::Commit)?
+                        {
                             telemetry::commit(Self::TOPOLOGY, &pipeline_id, true);
                         }
                         Ok(())
@@ -297,10 +298,9 @@ where
                     move || {
                         let commits = Arc::clone(&commits);
                         async move {
-                            commits
-                                .lock()
-                                .await
-                                .commit(source)
+                            let mut commits = commits.lock().await;
+                            commits.handle_timeout();
+                            commit_eligible(&mut commits, source)
                                 .await
                                 .map(|_| ())
                                 .map_err(PipelineError::Commit)
@@ -309,10 +309,9 @@ where
                 },
             )
             .await?;
-        commits
-            .lock()
-            .await
-            .commit(source)
+        let mut commits = commits.lock().await;
+        commits.finish();
+        commit_eligible(&mut commits, source)
             .await
             .map(|_| ())
             .map_err(PipelineError::Commit)
