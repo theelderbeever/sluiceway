@@ -8,7 +8,10 @@ mod policy;
 
 pub use fanout::{FanoutCollectorPipeline, FanoutPipeline};
 pub use linear::LinearPipeline;
-pub use policy::{BatchPolicy, Batched, CollectPolicy, Collected, CommitPolicy, Each, Unset};
+pub use policy::{
+    AfterRecords, AfterRecordsOrTimeout, BatchPolicy, Batched, CollectPolicy, Collected,
+    CommitAction, CommitEach, CommitPolicy, Each, PositionAction, Unset,
+};
 
 /// A source and its consuming transform, before delivery topology is selected.
 pub struct Pipeline<So, Tr = Unset> {

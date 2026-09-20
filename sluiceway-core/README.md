@@ -25,8 +25,11 @@ for the batch. No branch names, indexes, transform stages, or task-ID metadata a
 
 Source records carry message-local positions. Transforms receive each position by immutable
 reference alongside the owned payload. Completed batches retain the transformed records and their
-positions, while the source separately folds the positions into an internal checkpoint. Checkpoint
-persistence remains owned by sources through the generic `CheckpointStore<C>` interface.
+positions, while the runner folds positions into values implementing `Checkpoint<P>`. Checkpoint
+persistence remains owned by sources through `Source::commit`; the generic `CheckpointStore<C>`
+interface persists already constructed values. Custom policies can start a new checkpoint epoch at
+a position boundary. Checkpoint types that represent complete frontiers can override
+`Checkpoint::start_next_epoch`; the default starts an independently committable next epoch.
 
 `run()` consumes until the source stream naturally ends. A source can own graceful shutdown by
 observing a signal in `Source::stream`, stopping intake, draining its internal buffer, and then
@@ -37,7 +40,8 @@ Transforms may run concurrently but their outputs remain in observed source orde
 individual records with `.each()`, materialized batches with `.batched(...)`, or incremental
 batch-scoped `Collection`s with `.collect(...)`. Collection shape is independent from
 `CommitPolicy`, so successfully delivered records can be committed after every acknowledgement,
-after a record count, or after a count-or-time threshold.
+after a record count, after a count-or-time threshold, or at custom source-position boundaries.
+The built-ins are `CommitEach` (the default), `AfterRecords`, and `AfterRecordsOrTimeout`.
 
 Commit policies operate at acknowledged delivery boundaries:
 

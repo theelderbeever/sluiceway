@@ -14,9 +14,10 @@ use std::{
 use futures_core::Stream;
 use futures_util::{StreamExt, stream};
 use sluiceway::{
-    Batch, BatchPolicy, BoxSink, CheckpointStore, CollectPolicy, Collection, Collector,
+    AfterRecords, AfterRecordsOrTimeout, Batch, BatchPolicy, BoxSink, Checkpoint,
+    CheckpointEpochTransition, CheckpointStore, CollectPolicy, Collection, Collector, CommitAction,
     CommitPolicy, DeliveryFailure, Identity, NoCheckpoint, Pipeline, PipelineError, PipelineId,
-    Record, SharedBatch, Sink, Source, Transformer,
+    PositionAction, Record, SharedBatch, Sink, Source, Transformer,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +32,16 @@ impl Cursor {
             partition: "test",
             offset,
         }
+    }
+}
+
+impl Checkpoint<Cursor> for Cursor {
+    fn start_epoch(position: &Cursor) -> Self {
+        position.clone()
+    }
+
+    fn include_position(&mut self, position: &Cursor) {
+        *self = position.clone();
     }
 }
 
@@ -56,10 +67,6 @@ impl Source for Numbers {
                 .enumerate()
                 .map(|(offset, payload)| Ok(Record::new(Cursor::at(offset as u64), payload))),
         )
-    }
-
-    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
-        position.clone()
     }
 
     async fn commit(&self, checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
@@ -252,7 +259,7 @@ async fn each_delivery_is_independent_from_commit_cadence() {
             records: Arc::clone(&records),
         })
         .each()
-        .commit_policy(CommitPolicy::after(2).unwrap())
+        .commit_policy(AfterRecords::try_new(2).unwrap())
         .run()
         .await
         .unwrap();
@@ -276,7 +283,7 @@ async fn commit_timeout_fires_while_each_sink_waits_for_input() {
         .transform(Identity)
         .sink(RecordCollector { records })
         .each()
-        .commit_policy(CommitPolicy::after_or_timeout(100, Duration::from_millis(5)).unwrap())
+        .commit_policy(AfterRecordsOrTimeout::try_new(100, Duration::from_millis(5)).unwrap())
         .run_until(tokio::time::sleep(Duration::from_millis(20)))
         .await
         .unwrap();
@@ -296,12 +303,64 @@ async fn commit_timeout_fires_while_batch_sink_waits_for_input() {
         .transform(Identity)
         .sink(sink)
         .batched(BatchPolicy::try_new(1, Duration::from_secs(1)).unwrap())
-        .commit_policy(CommitPolicy::after_or_timeout(100, Duration::from_millis(5)).unwrap())
+        .commit_policy(AfterRecordsOrTimeout::try_new(100, Duration::from_millis(5)).unwrap())
         .run_until(tokio::time::sleep(Duration::from_millis(20)))
         .await
         .unwrap();
 
     assert_eq!(*committed.lock().unwrap(), vec![Cursor::at(0)]);
+}
+
+struct SlowSecondCollector {
+    finishes: Arc<AtomicUsize>,
+}
+
+struct SlowSecondSession {
+    finishes: Arc<AtomicUsize>,
+}
+
+impl Collector<Record<u64, Cursor>> for SlowSecondCollector {
+    type Session = SlowSecondSession;
+    type Error = Infallible;
+
+    async fn begin(&self) -> Result<Self::Session, Self::Error> {
+        Ok(SlowSecondSession {
+            finishes: Arc::clone(&self.finishes),
+        })
+    }
+}
+
+impl Collection<Record<u64, Cursor>> for SlowSecondSession {
+    type Error = Infallible;
+
+    async fn push(&mut self, _record: Record<u64, Cursor>) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn finish(self) -> Result<(), Self::Error> {
+        if self.finishes.fetch_add(1, Ordering::SeqCst) == 1 {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn elapsed_commit_deadline_includes_the_in_flight_collection() {
+    let (source, committed) = source(vec![1, 2]);
+
+    Pipeline::source(source)
+        .transform(Identity)
+        .sink(SlowSecondCollector {
+            finishes: Arc::new(AtomicUsize::new(0)),
+        })
+        .collect(CollectPolicy::try_new(1, Duration::from_secs(1)).unwrap())
+        .commit_policy(AfterRecordsOrTimeout::try_new(100, Duration::from_millis(5)).unwrap())
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(*committed.lock().unwrap(), vec![Cursor::at(1)]);
 }
 
 #[tokio::test]
@@ -315,7 +374,7 @@ async fn collector_processes_eagerly_and_acknowledges_on_finish() {
             collections: Arc::clone(&collections),
         })
         .collect(CollectPolicy::try_new(2, Duration::from_secs(1)).unwrap())
-        .commit_policy(CommitPolicy::after(3).unwrap())
+        .commit_policy(AfterRecords::try_new(3).unwrap())
         .run()
         .await
         .unwrap();
@@ -345,7 +404,7 @@ async fn shared_fanout_supports_each_delivery() {
             SharedRecordCollector(Arc::clone(&second)).into(),
         ])
         .each()
-        .commit_policy(CommitPolicy::after(2).unwrap())
+        .commit_policy(AfterRecords::try_new(2).unwrap())
         .run()
         .await
         .unwrap();
@@ -471,10 +530,6 @@ impl Source for PollCountingSource {
         .inspect(move |_| {
             polled.fetch_add(1, Ordering::SeqCst);
         })
-    }
-
-    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
-        position.clone()
     }
 
     async fn commit(&self, _checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
@@ -751,10 +806,6 @@ impl Source for StartedSource {
         stream::empty()
     }
 
-    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
-        position.clone()
-    }
-
     async fn commit(&self, _checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -948,11 +999,11 @@ fn collection_and_commit_policies_reject_zero_bounds() {
         Err(sluiceway::CollectConfigError::ZeroTimeout)
     ));
     assert!(matches!(
-        CommitPolicy::after(0),
+        AfterRecords::try_new(0),
         Err(sluiceway::CommitConfigError::ZeroRecords)
     ));
     assert!(matches!(
-        CommitPolicy::after_or_timeout(1, Duration::ZERO),
+        AfterRecordsOrTimeout::try_new(1, Duration::ZERO),
         Err(sluiceway::CommitConfigError::ZeroTimeout)
     ));
 }
@@ -981,10 +1032,6 @@ impl Source for FallibleSource {
         } else {
             vec![Ok(Record::new(Cursor::at(0), 1))]
         })
-    }
-
-    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
-        position.clone()
     }
 
     async fn commit(&self, _checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
@@ -1061,10 +1108,6 @@ impl Source for DelayedSource {
             }
             Ok(Record::new(Cursor::at(offset), offset))
         })
-    }
-
-    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
-        position.clone()
     }
 
     async fn commit(&self, checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
@@ -1147,10 +1190,6 @@ impl Source for GracefulSource {
         ]))
     }
 
-    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
-        position.clone()
-    }
-
     async fn commit(&self, checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
         self.committed.lock().unwrap().push(checkpoint);
         Ok(())
@@ -1215,10 +1254,6 @@ impl Source for OpenSource {
     ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_
     {
         stream::once(async { Ok(Record::new(Cursor::at(0), 1)) }).chain(stream::pending())
-    }
-
-    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
-        position.clone()
     }
 
     async fn commit(&self, checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
@@ -1287,10 +1322,6 @@ impl Source for PositionedSource {
         )
     }
 
-    fn track(_checkpoint: Option<Self::Checkpoint>, position: &Self::Position) -> Self::Checkpoint {
-        position.clone()
-    }
-
     async fn commit(&self, checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
         self.committed.lock().unwrap().push(checkpoint);
         Ok(())
@@ -1317,5 +1348,341 @@ async fn repeated_and_non_monotonic_checkpoints_remain_opaque() {
     assert_eq!(
         *committed.lock().unwrap(),
         vec![Cursor::at(4), Cursor::at(2)]
+    );
+}
+
+struct AfterCursorChanges {
+    every: usize,
+    previous: Option<u64>,
+    completed: usize,
+}
+
+impl AfterCursorChanges {
+    fn new(every: usize) -> Self {
+        Self {
+            every,
+            previous: None,
+            completed: 0,
+        }
+    }
+}
+
+impl CommitPolicy<Cursor> for AfterCursorChanges {
+    fn on_position(&mut self, position: &Cursor) -> PositionAction {
+        match self.previous.replace(position.offset) {
+            None => PositionAction::Continue,
+            Some(previous) if previous == position.offset => PositionAction::Continue,
+            Some(_) => {
+                self.completed += 1;
+                if self.completed == self.every {
+                    self.completed = 0;
+                    PositionAction::StartNewEpoch
+                } else {
+                    PositionAction::Continue
+                }
+            }
+        }
+    }
+
+    fn on_acknowledged(&mut self, _records: usize) -> CommitAction {
+        CommitAction::Continue
+    }
+
+    fn on_committed(&mut self) {}
+}
+
+#[tokio::test]
+async fn checkpoint_epochs_commit_contiguous_cursor_groups_in_source_order() {
+    let committed = Arc::new(Mutex::new(Vec::new()));
+    let source = PositionedSource {
+        positions: vec![
+            Cursor::at(4),
+            Cursor::at(4),
+            Cursor::at(2),
+            Cursor::at(2),
+            Cursor::at(4),
+        ],
+        committed: Arc::clone(&committed),
+    };
+    let (sink, _) = linear_collector(Ack::Exact);
+
+    Pipeline::source(source)
+        .transform(Identity)
+        .sink(sink)
+        .batched(BatchPolicy::try_new(10, Duration::from_secs(1)).unwrap())
+        .commit_policy(AfterCursorChanges::new(1))
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *committed.lock().unwrap(),
+        vec![Cursor::at(4), Cursor::at(2), Cursor::at(4)]
+    );
+}
+
+#[tokio::test]
+async fn failed_batch_discards_every_completed_checkpoint_epoch() {
+    let committed = Arc::new(Mutex::new(Vec::new()));
+    let source = PositionedSource {
+        positions: vec![Cursor::at(1), Cursor::at(2), Cursor::at(3)],
+        committed: Arc::clone(&committed),
+    };
+    let (sink, _) = linear_collector(Ack::Fail);
+
+    let result = Pipeline::source(source)
+        .transform(Identity)
+        .sink(sink)
+        .batched(BatchPolicy::try_new(10, Duration::from_secs(1)).unwrap())
+        .commit_policy(AfterCursorChanges::new(1))
+        .run()
+        .await;
+
+    assert!(matches!(result, Err(PipelineError::Sink(_))));
+    assert!(committed.lock().unwrap().is_empty());
+}
+
+struct CommitObservingCollector {
+    committed: Arc<Mutex<Vec<Cursor>>>,
+    finished: Arc<AtomicBool>,
+}
+
+struct CommitObservingSession {
+    committed: Arc<Mutex<Vec<Cursor>>>,
+    finished: Arc<AtomicBool>,
+}
+
+impl Collector<Record<(), Cursor>> for CommitObservingCollector {
+    type Session = CommitObservingSession;
+    type Error = Infallible;
+
+    async fn begin(&self) -> Result<Self::Session, Self::Error> {
+        Ok(CommitObservingSession {
+            committed: Arc::clone(&self.committed),
+            finished: Arc::clone(&self.finished),
+        })
+    }
+}
+
+impl Collection<Record<(), Cursor>> for CommitObservingSession {
+    type Error = Infallible;
+
+    async fn push(&mut self, _record: Record<(), Cursor>) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn finish(self) -> Result<(), Self::Error> {
+        assert!(self.committed.lock().unwrap().is_empty());
+        self.finished.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn completed_collection_checkpoint_epochs_wait_for_finish() {
+    let committed = Arc::new(Mutex::new(Vec::new()));
+    let finished = Arc::new(AtomicBool::new(false));
+    let source = PositionedSource {
+        positions: vec![Cursor::at(1), Cursor::at(2), Cursor::at(3)],
+        committed: Arc::clone(&committed),
+    };
+
+    Pipeline::source(source)
+        .transform(Identity)
+        .sink(CommitObservingCollector {
+            committed: Arc::clone(&committed),
+            finished: Arc::clone(&finished),
+        })
+        .collect(CollectPolicy::try_new(10, Duration::from_secs(1)).unwrap())
+        .commit_policy(AfterCursorChanges::new(1))
+        .run()
+        .await
+        .unwrap();
+
+    assert!(finished.load(Ordering::SeqCst));
+    assert_eq!(
+        *committed.lock().unwrap(),
+        vec![Cursor::at(1), Cursor::at(2), Cursor::at(3)]
+    );
+}
+
+#[tokio::test]
+async fn fanout_failure_discards_every_completed_checkpoint_epoch() {
+    let committed = Arc::new(Mutex::new(Vec::new()));
+    let source = PositionedSource {
+        positions: vec![Cursor::at(1), Cursor::at(2), Cursor::at(3)],
+        committed: Arc::clone(&committed),
+    };
+    let (first, _) = shared_collector(Ack::Exact);
+    let (second, _) = shared_collector(Ack::Fail);
+
+    let result = Pipeline::source(source)
+        .transform(Identity)
+        .fanout()
+        .shared()
+        .sinks([first.into(), second.into()])
+        .batched(BatchPolicy::try_new(10, Duration::from_secs(1)).unwrap())
+        .commit_policy(AfterCursorChanges::new(1))
+        .run()
+        .await;
+
+    assert!(matches!(result, Err(PipelineError::Sinks(_))));
+    assert!(committed.lock().unwrap().is_empty());
+}
+
+struct FailingFragmentSource {
+    positions: Vec<Cursor>,
+    attempts: Arc<Mutex<Vec<Cursor>>>,
+}
+
+impl Source for FailingFragmentSource {
+    type Payload = ();
+    type Position = Cursor;
+    type Checkpoint = Cursor;
+    type Error = SourceFailure;
+
+    fn stream(
+        &self,
+    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_
+    {
+        stream::iter(
+            self.positions
+                .clone()
+                .into_iter()
+                .map(|position| Ok(Record::new(position, ()))),
+        )
+    }
+
+    async fn commit(&self, checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
+        let mut attempts = self.attempts.lock().unwrap();
+        attempts.push(checkpoint);
+        if attempts.len() == 2 {
+            Err(SourceFailure)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct CountingCursorChanges {
+    inner: AfterCursorChanges,
+    committed: Arc<AtomicUsize>,
+}
+
+impl CommitPolicy<Cursor> for CountingCursorChanges {
+    fn on_position(&mut self, position: &Cursor) -> PositionAction {
+        self.inner.on_position(position)
+    }
+
+    fn on_acknowledged(&mut self, records: usize) -> CommitAction {
+        self.inner.on_acknowledged(records)
+    }
+
+    fn on_committed(&mut self) {
+        self.committed.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_epoch_commit_failure_stops_later_epochs_and_callbacks() {
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    let source = FailingFragmentSource {
+        positions: vec![Cursor::at(1), Cursor::at(2), Cursor::at(3)],
+        attempts: Arc::clone(&attempts),
+    };
+    let (sink, _) = linear_collector(Ack::Exact);
+
+    let result = Pipeline::source(source)
+        .transform(Identity)
+        .sink(sink)
+        .batched(BatchPolicy::try_new(10, Duration::from_secs(1)).unwrap())
+        .commit_policy(CountingCursorChanges {
+            inner: AfterCursorChanges::new(1),
+            committed: Arc::clone(&callbacks),
+        })
+        .run()
+        .await;
+
+    assert!(matches!(result, Err(PipelineError::Commit(_))));
+    assert_eq!(
+        *attempts.lock().unwrap(),
+        vec![Cursor::at(1), Cursor::at(2)]
+    );
+    assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+}
+
+struct FullFrontierSource {
+    positions: Vec<Cursor>,
+    committed: Arc<Mutex<Vec<Vec<u64>>>>,
+}
+
+#[derive(Clone)]
+struct FullFrontier(Vec<u64>);
+
+impl Checkpoint<Cursor> for FullFrontier {
+    fn start_epoch(position: &Cursor) -> Self {
+        Self(vec![position.offset])
+    }
+
+    fn include_position(&mut self, position: &Cursor) {
+        self.0.push(position.offset);
+    }
+
+    fn start_next_epoch(self, first_position: &Cursor) -> CheckpointEpochTransition<Self> {
+        let mut next_epoch = self.clone();
+        next_epoch.include_position(first_position);
+        CheckpointEpochTransition {
+            completed_epoch: self,
+            next_epoch,
+        }
+    }
+}
+
+impl Source for FullFrontierSource {
+    type Payload = ();
+    type Position = Cursor;
+    type Checkpoint = FullFrontier;
+    type Error = Infallible;
+
+    fn stream(
+        &self,
+    ) -> impl Stream<Item = Result<Record<Self::Payload, Self::Position>, Self::Error>> + Send + '_
+    {
+        stream::iter(
+            self.positions
+                .clone()
+                .into_iter()
+                .map(|position| Ok(Record::new(position, ()))),
+        )
+    }
+
+    async fn commit(&self, checkpoint: Self::Checkpoint) -> Result<(), Self::Error> {
+        self.committed.lock().unwrap().push(checkpoint.0);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn source_can_carry_a_complete_frontier_into_the_next_checkpoint_epoch() {
+    let committed = Arc::new(Mutex::new(Vec::new()));
+    let source = FullFrontierSource {
+        positions: vec![Cursor::at(1), Cursor::at(2), Cursor::at(3)],
+        committed: Arc::clone(&committed),
+    };
+    let (sink, _) = linear_collector(Ack::Exact);
+
+    Pipeline::source(source)
+        .transform(Identity)
+        .sink(sink)
+        .batched(BatchPolicy::try_new(10, Duration::from_secs(1)).unwrap())
+        .commit_policy(AfterCursorChanges::new(1))
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *committed.lock().unwrap(),
+        vec![vec![1], vec![1, 2], vec![1, 2, 3]]
     );
 }

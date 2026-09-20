@@ -36,13 +36,14 @@ pub use error::{
 };
 pub use identity::{PipelineId, PipelineIdError};
 pub use pipeline::{
-    BatchPolicy, Batched, CollectPolicy, Collected, CommitPolicy, Each, FanoutBuilder,
-    FanoutCollectorPipeline, FanoutPipeline, LinearPipeline, Pipeline, Unset,
+    AfterRecords, AfterRecordsOrTimeout, BatchPolicy, Batched, CollectPolicy, Collected,
+    CommitAction, CommitEach, CommitPolicy, Each, FanoutBuilder, FanoutCollectorPipeline,
+    FanoutPipeline, LinearPipeline, Pipeline, PositionAction, Unset,
 };
 pub use record::Record;
 pub use sink::{
     Batch, BoxCollector, BoxRecordSink, BoxSink, BoxedCollector, BoxedSink, Cloned, Collection,
     Collector, FanoutMode, FanoutRecordMode, Shared, SharedBatch, SharedRecord, Sink,
 };
-pub use source::Source;
+pub use source::{Checkpoint, CheckpointEpochTransition, Source};
 pub use transform::{Identity, Transform, Transformer};
