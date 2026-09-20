@@ -1,10 +1,9 @@
 [workspace]
-# GitHub Releases are the human approval gate and own the release tags. The
-# publish workflow invokes release-plz only to publish crates in dependency
-# order.
 changelog_update = false
-git_release_enable = false
-git_tag_enable = false
+git_release_enable = true
+git_release_type = "auto"
+git_tag_enable = true
+release_always = false
 # Keep prereleases on the current base version (for example,
 # 0.1.0-alpha.1 -> 0.1.0-alpha.2). A semver-check failure otherwise takes
 # precedence over prerelease handling and can bump the 0.x minor version.
