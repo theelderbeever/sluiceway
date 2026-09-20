@@ -1,7 +1,0 @@
-[workspace]
-git_release_enable = false
-git_tag_enable = false
-
-[[package]]
-name = "sluiceway-contrib"
-release = false
